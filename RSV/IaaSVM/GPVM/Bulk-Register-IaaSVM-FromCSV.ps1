@@ -154,6 +154,13 @@ foreach ($row in $csvData) {
         continue
     }
 
+    # --- Validate subscriptions match ---
+    if ($vmSubscriptionId -ne $vaultSubscriptionId) {
+        Write-Host "  ERROR: VM Subscription ID ('$vmSubscriptionId') does not match Vault Subscription ID ('$vaultSubscriptionId')." -ForegroundColor Red
+        $summary += [PSCustomObject]@{ Row = $rowNumber; VM = $vmName; Status = "FAILED"; Detail = "Subscription mismatch: VM=$vmSubscriptionId, Vault=$vaultSubscriptionId" }
+        continue
+    }
+
     Write-Host "  Vault:  $vaultName (RG: $vaultResourceGroup, Sub: $vaultSubscriptionId)" -ForegroundColor Gray
     Write-Host "  VM:     $vmName (RG: $vmResourceGroup, Sub: $vmSubscriptionId)" -ForegroundColor Gray
     Write-Host "  Policy: $policyName" -ForegroundColor Gray

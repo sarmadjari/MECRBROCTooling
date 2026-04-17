@@ -94,6 +94,13 @@ if ([string]::IsNullOrWhiteSpace($vmSubscriptionId)) {
     Write-Host "  Using vault subscription: $vmSubscriptionId" -ForegroundColor Gray
 }
 
+if ($vmSubscriptionId -ne $vaultSubscriptionId) {
+    Write-Host ""
+    Write-Host "ERROR: VM Subscription ID ('$vmSubscriptionId') does not match Vault Subscription ID ('$vaultSubscriptionId')." -ForegroundColor Red
+    Write-Host "  This script requires the VM and the Recovery Services Vault to be in the same subscription." -ForegroundColor Red
+    exit 1
+}
+
 Write-Host ""
 Write-Host "VM Resource Group Name:" -ForegroundColor Cyan
 $vmResourceGroup = Read-Host "  Enter Resource Group Name"
