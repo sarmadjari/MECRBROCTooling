@@ -582,12 +582,64 @@ try {
     Write-Host "Configuring backup protection..." -ForegroundColor Cyan
     Start-Sleep -Seconds 50
     
-    # Verify protection status
+    # -----------------------------------------------------------------------
+    # PATCH (2026-07-09): Tolerant protection verification.
+    #
+    # WHY THIS WAS PATCHED:
+    #   Enable-protection (the PUT above) is ASYNCHRONOUS. A single GET on the
+    #   protected item immediately afterwards frequently returns "(404) Not
+    #   Found" because the item has not finished materializing at its REST path
+    #   yet -- even though protection WAS configured successfully (the Azure
+    #   Portal shows the item with a successful backup / restore point). The old
+    #   code treated that transient 404 as "verification failed", producing a
+    #   misleading warning on a run that actually succeeded.
+    #
+    # FIX:
+    #   Poll the protected item, tolerating 404s as "still provisioning". If it
+    #   is still not directly retrievable, fall back to LISTING the container's
+    #   protected items and matching by friendly name before reporting a soft,
+    #   non-alarming note. Verification never blocks or fails the run.
+    # -----------------------------------------------------------------------
     Write-Host "Verifying protection status..." -ForegroundColor Cyan
-    
-    try {
-        $verifyProtectionResponse = Invoke-RestMethod -Uri $enableProtectionUri -Method GET -Headers $headers
-        
+
+    $verifyProtectionResponse = $null
+    $verifyMaxRetries = 10
+    $verifyRetry = 0
+
+    while ($null -eq $verifyProtectionResponse -and $verifyRetry -lt $verifyMaxRetries) {
+        try {
+            $verifyProtectionResponse = Invoke-RestMethod -Uri $enableProtectionUri -Method GET -Headers $headers
+        } catch {
+            $verifyStatus = $_.Exception.Response.StatusCode.value__
+            if ($verifyStatus -eq 404) {
+                # Item not materialized yet - this is expected right after an
+                # async enable-protection. Keep waiting.
+                $verifyRetry++
+                Write-Host "  Provisioning... ($verifyRetry/$verifyMaxRetries)" -ForegroundColor Yellow
+                Start-Sleep -Seconds 15
+            } else {
+                # A non-404 error is not a transient provisioning delay.
+                Write-Host "  WARNING: Verification call failed (HTTP $verifyStatus): $($_.Exception.Message)" -ForegroundColor Yellow
+                break
+            }
+        }
+    }
+
+    # Fallback: if the direct GET never resolved, look the item up in the
+    # container's protected-items list by friendly name.
+    if ($null -eq $verifyProtectionResponse) {
+        try {
+            $protectedItemsListUri = "https://management.azure.com/subscriptions/$vaultSubscriptionId/resourceGroups/$vaultResourceGroup/providers/Microsoft.RecoveryServices/vaults/$vaultName/backupFabrics/Azure/protectionContainers/$containerNameEncoded/protectedItems?api-version=$apiVersion"
+            $protectedItemsList = @((Invoke-RestMethod -Uri $protectedItemsListUri -Method GET -Headers $headers).value)
+            $verifyProtectionResponse = $protectedItemsList | Where-Object {
+                $_.properties.friendlyName -eq $fileShareName
+            } | Select-Object -First 1
+        } catch {
+            # Ignore - handled by the soft note below.
+        }
+    }
+
+    if ($verifyProtectionResponse) {
         Write-Host ""
         Write-Host "========================================" -ForegroundColor Green
         Write-Host "  PROTECTION CONFIGURED SUCCESSFULLY!" -ForegroundColor Green
@@ -605,10 +657,11 @@ try {
         Write-Host "  2. You can trigger an on-demand backup from Azure Portal -> Vault -> Backup Items" -ForegroundColor White
         Write-Host "  3. Monitor backup jobs in Azure Portal > Recovery Services Vault > Backup Jobs" -ForegroundColor White
         Write-Host ""
-    } catch {
-        Write-Host "  WARNING: Protection configured but verification failed" -ForegroundColor Yellow
-        Write-Host "  Error: $($_.Exception.Message)" -ForegroundColor Yellow
-        Write-Host "  Please check the Azure Portal to verify protection status." -ForegroundColor Yellow
+    } else {
+        Write-Host ""
+        Write-Host "  NOTE: Protection was submitted successfully, but the item was not yet" -ForegroundColor Yellow
+        Write-Host "        retrievable via the API (it can take a few minutes to appear)." -ForegroundColor Yellow
+        Write-Host "        Verify in the Azure Portal: Vault '$vaultName' > Backup Items > Azure Storage (Azure Files)." -ForegroundColor Yellow
         Write-Host ""
     }
     

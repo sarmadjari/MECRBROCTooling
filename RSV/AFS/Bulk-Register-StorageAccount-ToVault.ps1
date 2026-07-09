@@ -1,18 +1,18 @@
 <#
 .SYNOPSIS
-    Bulk configures backup protection for Azure File Shares using REST API.
+    Bulk registers multiple Azure Storage Accounts to a Recovery Services Vault using REST API.
 
 .DESCRIPTION
-    This script reads a CSV file and enables backup protection for each file share listed.
-    It uses the same REST API flow as Configure-FileShare-Protection.ps1, per item:
+    This script reads a CSV file and registers each storage account (containing Azure File
+    Shares) to a Recovery Services Vault for backup protection using the Azure Backup REST API.
+    It uses the same REST API flow as Register-StorageAccount-ToVault.ps1, per item.
 
     Per-item steps:
-    1. Verify storage account is registered to the vault
-    2. Trigger inquire to discover file shares in the storage account
-    3. List protectable items and verify the target file share exists
-    4. Find the backup policy by name
-    5. Enable protection (PUT)
-    6. Poll/verify protection state
+    1. Check current registration status (skips if already Registered).
+    2. Register the storage account to the vault (PUT).
+    3. Poll/verify registration status (SUCCESS, PENDING, or FAILED).
+
+    Container discovery is refreshed ONCE per unique vault up front (before the item loop).
 
     PARALLELISM:
     - Items are processed in parallel using PowerShell 7's ForEach-Object -Parallel,
@@ -22,7 +22,7 @@
     - Set -MaxParallel 1 to force sequential processing on any version.
     - REST calls include automatic retry/backoff on HTTP 429 (throttling).
 
-    CSV Format (Bulk-Configure-FileShare-Protection_Input.csv):
+    CSV Format (Bulk-Register-StorageAccount-ToVault_Input.csv):
       Header row required. Columns:
         VaultSubscriptionId              - Subscription ID of the Recovery Services Vault
         VaultResourceGroup               - Resource group of the vault
@@ -30,12 +30,10 @@
         StorageAccountSubscriptionId     - Subscription ID of the storage account (leave empty to use vault subscription)
         StorageAccountResourceGroup      - Resource group of the storage account
         StorageAccountName               - Name of the storage account
-        FileShareName                    - Name of the file share to protect
-        PolicyName                       - Name of the backup policy to assign
 
     Metrics tracked:
     - Total items processed
-    - Success / Failed / Skipped counts
+    - Success / Failed / Skipped / Pending counts
     - Per-item duration
     - Total elapsed time
     - Summary table at the end
@@ -43,31 +41,30 @@
 
     Prerequisites:
     - Azure PowerShell (Connect-AzAccount) OR Azure CLI (az login) authentication
-    - Storage accounts must be registered to the vault
-    - Appropriate RBAC permissions
+    - Appropriate RBAC permissions on both Storage Account(s) and Recovery Services Vault
 
 .PARAMETER CsvPath
     Path to the input CSV file. If not provided, the script looks for
-    Bulk-Configure-FileShare-Protection_Input.csv in the same directory,
+    Bulk-Register-StorageAccount-ToVault_Input.csv in the same directory,
     or prompts interactively.
 
 .PARAMETER MaxParallel
-    Maximum number of file shares to configure concurrently (default 5, per the
-    AFS "5 at a time" guidance). Requires PowerShell 7+; on Windows PowerShell 5.1
-    the script runs sequentially. Use 1 to force sequential processing.
+    Maximum number of storage accounts to register concurrently (default 5).
+    Requires PowerShell 7+; on Windows PowerShell 5.1 the script runs sequentially.
+    Use 1 to force sequential processing.
 
 .EXAMPLE
-    .\Bulk-Configure-FileShare-Protection.ps1 -CsvPath "C:\inputs\fileshares.csv"
-    Runs bulk protection using the specified CSV file (up to 5 concurrent).
+    .\Bulk-Register-StorageAccount-ToVault.ps1 -CsvPath "C:\inputs\storageaccounts.csv"
+    Runs bulk registration using the specified CSV file (up to 5 concurrent).
 
 .EXAMPLE
-    .\Bulk-Configure-FileShare-Protection.ps1 -MaxParallel 1
-    Runs bulk protection one file share at a time (sequential).
+    .\Bulk-Register-StorageAccount-ToVault.ps1 -MaxParallel 1
+    Runs bulk registration one storage account at a time (sequential).
 
 .NOTES
     Author: AFS Backup Expert
-    Date: March 22, 2026
-    Reference: https://learn.microsoft.com/en-us/rest/api/backup/protected-items/create-or-update?view=rest-backup-2025-08-01
+    Date: July 9, 2026
+    Reference: https://learn.microsoft.com/en-us/azure/backup/backup-azure-file-share-rest-api
     Reference: https://learn.microsoft.com/en-us/rest/api/azure/#create-the-request (Bearer token auth header)
 #>
 
@@ -87,21 +84,18 @@ $apiVersion = "2025-08-01"  # Azure Backup REST API version
 
 if ($MaxParallel -lt 1) { $MaxParallel = 1 }
 
-# Load System.Web for URL encoding (required in PowerShell 7)
-Add-Type -AssemblyName System.Web
-
 # ============================================================================
 # RUNTIME INPUT
 # ============================================================================
 
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host "  Bulk Configure Azure File Share Backup Protection" -ForegroundColor Cyan
+Write-Host "  Bulk Register Storage Accounts to Recovery Services Vault" -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host ""
 
 # CSV file path — use param, else prompt
-$defaultCsvPath = Join-Path $PSScriptRoot "Bulk-Configure-FileShare-Protection_Input.csv"
+$defaultCsvPath = Join-Path $PSScriptRoot "Bulk-Register-StorageAccount-ToVault_Input.csv"
 
 if ([string]::IsNullOrWhiteSpace($CsvPath)) {
     Write-Host "CSV Input File Path (press Enter for default):" -ForegroundColor Cyan
@@ -142,27 +136,20 @@ if ($useParallel) {
 Write-Host ""
 
 # Preview
-Write-Host "Items to configure:" -ForegroundColor Cyan
+Write-Host "Storage accounts to register:" -ForegroundColor Cyan
 Write-Host ""
-Write-Host ("{0,-5} {1,-25} {2,-25} {3,-20} {4,-20}" -f "#", "Storage Account", "File Share", "Vault", "Policy") -ForegroundColor Cyan
-Write-Host ("{0,-5} {1,-25} {2,-25} {3,-20} {4,-20}" -f ("-" * 5), ("-" * 25), ("-" * 25), ("-" * 20), ("-" * 20)) -ForegroundColor Gray
+Write-Host ("{0,-5} {1,-30} {2,-25} {3,-25}" -f "#", "Storage Account", "Resource Group", "Vault") -ForegroundColor Cyan
+Write-Host ("{0,-5} {1,-30} {2,-25} {3,-25}" -f ("-" * 5), ("-" * 30), ("-" * 25), ("-" * 25)) -ForegroundColor Gray
 
 $itemNum = 1
 foreach ($row in $csvData) {
-    Write-Host ("{0,-5} {1,-25} {2,-25} {3,-20} {4,-20}" -f $itemNum, $row.StorageAccountName, $row.FileShareName, $row.VaultName, $row.PolicyName) -ForegroundColor White
+    Write-Host ("{0,-5} {1,-30} {2,-25} {3,-25}" -f $itemNum, $row.StorageAccountName, $row.StorageAccountResourceGroup, $row.VaultName) -ForegroundColor White
     $itemNum++
 }
 
 Write-Host ""
 
-# Caution: Policy tier behavior
-Write-Host "CAUTION:" -ForegroundColor DarkYellow
-Write-Host "  - 'Snapshot' policy       : Backups are stored as snapshots in the Storage Account only, in the Storage Account region." -ForegroundColor DarkYellow
-Write-Host "  - 'Vault-Standard' policy : Backups are stored as snapshots in the Storage Account (Storage Account region) and transferred to the Recovery Services Vault (Vault region)." -ForegroundColor DarkYellow
-Write-Host "  Cross-Region Backup (ROC) REQUIRES a 'Vault-Standard' policy. Verify the tier in the Azure Portal (Vault -> Backup Policies -> Backup tier) before proceeding." -ForegroundColor DarkYellow
-Write-Host ""
-
-Write-Host "Continue with bulk protection? (yes/no):" -ForegroundColor Cyan
+Write-Host "Continue with bulk registration? (yes/no):" -ForegroundColor Cyan
 $confirm = Read-Host "  Enter choice"
 if ($confirm -ne "yes" -and $confirm -ne "YES" -and $confirm -ne "y" -and $confirm -ne "Y") {
     Write-Host "Operation cancelled by user." -ForegroundColor Yellow
@@ -209,6 +196,36 @@ $headers = @{
 }
 
 # ============================================================================
+# PRE-STEP: REFRESH CONTAINER DISCOVERY (once per unique vault)
+# ============================================================================
+# Done up front (sequentially) so the parallel worker does not need shared state.
+
+Write-Host ""
+Write-Host "Refreshing container discovery for target vault(s)..." -ForegroundColor Cyan
+
+$uniqueVaults = $csvData |
+    ForEach-Object { [pscustomobject]@{ Sub = $_.VaultSubscriptionId.Trim(); Rg = $_.VaultResourceGroup.Trim(); Name = $_.VaultName.Trim() } } |
+    Where-Object { $_.Sub -and $_.Rg -and $_.Name } |
+    Sort-Object Sub, Rg, Name -Unique
+
+foreach ($v in $uniqueVaults) {
+    $refreshUri = "https://management.azure.com/subscriptions/$($v.Sub)/resourceGroups/$($v.Rg)/providers/Microsoft.RecoveryServices/vaults/$($v.Name)/backupFabrics/Azure/refreshContainers?api-version=$apiVersion&`$filter=backupManagementType eq 'AzureStorage'"
+    try {
+        Invoke-RestMethod -Uri $refreshUri -Method POST -Headers $headers | Out-Null
+        Write-Host "  Refresh initiated for '$($v.Name)'" -ForegroundColor Green
+    } catch {
+        $rc = $null; try { $rc = $_.Exception.Response.StatusCode.value__ } catch { }
+        if ($rc -eq 202 -or $rc -eq 204) {
+            Write-Host "  Refresh accepted for '$($v.Name)' ($rc)" -ForegroundColor Green
+        } else {
+            Write-Host "  WARNING: Refresh for '$($v.Name)' returned: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+}
+Write-Host "  Waiting for discovery to settle..." -ForegroundColor Gray
+Start-Sleep -Seconds 10
+
+# ============================================================================
 # PER-ITEM WORKER
 # ============================================================================
 # Defined as text so the SAME logic runs both in the main runspace (PS 5.1
@@ -217,8 +234,6 @@ $headers = @{
 
 $workerText = @'
 param($row, $itemIndex, $totalItems, $headers, $apiVersion)
-
-Add-Type -AssemblyName System.Web
 
 $tag = "[$itemIndex/$totalItems]"
 function Say([string]$m, $c = "Gray") { Write-Host ("{0} {1}" -f $tag, $m) -ForegroundColor $c }
@@ -253,163 +268,78 @@ $vaultName = $row.VaultName.Trim()
 $storageSubscriptionId = if ([string]::IsNullOrWhiteSpace($row.StorageAccountSubscriptionId)) { $vaultSubscriptionId } else { $row.StorageAccountSubscriptionId.Trim() }
 $storageResourceGroup = $row.StorageAccountResourceGroup.Trim()
 $storageAccountName = $row.StorageAccountName.Trim()
-$fileShareName = $row.FileShareName.Trim()
-$policyName = $row.PolicyName.Trim()
 
 $itemResult = @{
     Index = $itemIndex
-    Item = "$storageAccountName/$fileShareName"
+    Item = $storageAccountName
+    ResourceGroup = $storageResourceGroup
     Vault = $vaultName
-    Policy = $policyName
     Status = "Unknown"
-    ProtectionState = ""
+    RegistrationStatus = ""
     Detail = ""
     Duration = ""
 }
 
-Say "$storageAccountName / $fileShareName (Vault: $vaultName | Policy: $policyName)" Cyan
+Say "$storageAccountName (RG: $storageResourceGroup | Vault: $vaultName)" Cyan
 
 # Validate required fields
 if ([string]::IsNullOrWhiteSpace($vaultSubscriptionId) -or [string]::IsNullOrWhiteSpace($vaultResourceGroup) -or
     [string]::IsNullOrWhiteSpace($vaultName) -or [string]::IsNullOrWhiteSpace($storageResourceGroup) -or
-    [string]::IsNullOrWhiteSpace($storageAccountName) -or [string]::IsNullOrWhiteSpace($fileShareName) -or
-    [string]::IsNullOrWhiteSpace($policyName)) {
+    [string]::IsNullOrWhiteSpace($storageAccountName)) {
     Say "  SKIPPED: Missing required fields in CSV row" Yellow
     $itemResult.Status = "SKIPPED"
     $itemResult.Detail = "Missing required CSV fields"
     return (Emit $itemResult)
 }
 
-# Construct identifiers
 $storageAccountResourceId = "/subscriptions/$storageSubscriptionId/resourceGroups/$storageResourceGroup/providers/Microsoft.Storage/storageAccounts/$storageAccountName"
-$containerName = "StorageContainer;storage;$storageResourceGroup;$storageAccountName"
+$containerName = "StorageContainer;Storage;$storageResourceGroup;$storageAccountName"
+$containerUri = "https://management.azure.com/subscriptions/$vaultSubscriptionId/resourceGroups/$vaultResourceGroup/providers/Microsoft.RecoveryServices/vaults/$vaultName/backupFabrics/Azure/protectionContainers/$containerName`?api-version=$apiVersion"
 
-# STEP A: Verify storage account is registered
-Say "  Step A: Verifying storage account registration..." Cyan
-$verifyContainerUri = "https://management.azure.com/subscriptions/$vaultSubscriptionId/resourceGroups/$vaultResourceGroup/providers/Microsoft.RecoveryServices/vaults/$vaultName/backupFabrics/Azure/protectionContainers/$containerName`?api-version=$apiVersion"
-$registrationOk = $false
+# Step A: Check current registration status (skip if already Registered)
+Say "  Step A: Checking current registration status..." Cyan
+$alreadyRegistered = $false
 try {
-    $containerResponse = Invoke-RestRetry $verifyContainerUri "GET" $headers
-    if ($containerResponse.properties.registrationStatus -eq "Registered") {
-        $registrationOk = $true
-        Say "    Registered (Health: $($containerResponse.properties.healthStatus))" Green
+    $existing = Invoke-RestRetry $containerUri "GET" $headers
+    if ($existing.properties.registrationStatus -eq "Registered") {
+        $alreadyRegistered = $true
+        Say "    Already registered (Health: $($existing.properties.healthStatus))" Yellow
     } else {
-        Say "    FAILED: Registration status is '$($containerResponse.properties.registrationStatus)'" Red
+        Say "    Current status: $($existing.properties.registrationStatus)" Gray
     }
 } catch {
-    Say "    FAILED: Storage account not registered - $($_.Exception.Message)" Red
+    Say "    Not yet registered - will register" Gray
 }
 
-if (-not $registrationOk) {
-    $itemResult.Status = "FAILED"
-    $itemResult.Detail = "Storage account not registered to vault"
+if ($alreadyRegistered) {
+    $itemResult.Status = "SKIPPED"
+    $itemResult.RegistrationStatus = "Registered"
+    $itemResult.Detail = "Already registered to vault"
     return (Emit $itemResult)
 }
 
-# STEP B: Inquire file shares in storage account
-Say "  Step B: Discovering file shares..." Cyan
-$inquireUri = "https://management.azure.com/subscriptions/$vaultSubscriptionId/resourceGroups/$vaultResourceGroup/providers/Microsoft.RecoveryServices/vaults/$vaultName/backupFabrics/Azure/protectionContainers/$containerName/inquire?api-version=$apiVersion"
-try {
-    Invoke-RestMethod -Uri $inquireUri -Method POST -Headers $headers | Out-Null
-    Say "    Inquire completed" Green
-    Start-Sleep -Seconds 5
-} catch {
-    $inquireStatusCode = $_.Exception.Response.StatusCode.value__
-    if ($inquireStatusCode -eq 202 -or $inquireStatusCode -eq 200) {
-        Say "    Inquire initiated" Green
-        Start-Sleep -Seconds 5
-    } else {
-        Say "    WARNING: Inquire returned: $($_.Exception.Message) - continuing" Yellow
-    }
-}
-
-# STEP C: List protectable items and verify file share exists
-Say "  Step C: Verifying file share exists in protectable items..." Cyan
-$protectableItemsUri = "https://management.azure.com/subscriptions/$vaultSubscriptionId/resourceGroups/$vaultResourceGroup/providers/Microsoft.RecoveryServices/vaults/$vaultName/backupProtectableItems?api-version=$apiVersion&`$filter=backupManagementType eq 'AzureStorage'"
-$protectedItemName = $null
-$fileShareFound = $false
-try {
-    $protectableResponse = Invoke-RestRetry $protectableItemsUri "GET" $headers
-    $protectableItems = @($protectableResponse.value)
-    if ($protectableItems.Count -gt 0) {
-        $targetFileShare = $protectableItems | Where-Object {
-            $_.properties.friendlyName -eq $fileShareName -and
-            $_.properties.parentContainerFriendlyName -eq $storageAccountName
-        } | Select-Object -First 1
-        if ($targetFileShare) {
-            $fileShareFound = $true
-            $protectedItemName = $targetFileShare.name
-            Say "    Target file share found: $fileShareName (State: $($targetFileShare.properties.protectionState))" Green
-            if ($targetFileShare.properties.protectionState -ne "NotProtected") {
-                Say "    NOTE: File share is already protected - will update policy" Yellow
-            }
-        } else {
-            Say "    File share '$fileShareName' not found in protectable items" Red
-        }
-    } else {
-        Say "    No protectable file shares found" Red
-    }
-} catch {
-    Say "    WARNING: Could not list protectable items: $($_.Exception.Message)" Yellow
-}
-
-# Fallback to manual name construction if not found via API
-if (-not $fileShareFound) {
-    $protectedItemName = "AzureFileShare;$fileShareName"
-    Say "    Using manual name: $protectedItemName" Yellow
-}
-
-# STEP D: Find policy by name
-Say "  Step D: Finding policy '$policyName'..." Cyan
-$policyId = $null
-try {
-    $policiesUri = "https://management.azure.com/subscriptions/$vaultSubscriptionId/resourceGroups/$vaultResourceGroup/providers/Microsoft.RecoveryServices/vaults/$vaultName/backupPolicies?api-version=$apiVersion&`$filter=backupManagementType eq 'AzureStorage'"
-    $policiesResponse = Invoke-RestRetry $policiesUri "GET" $headers
-    $matchedPolicy = @($policiesResponse.value) | Where-Object { $_.name -eq $policyName } | Select-Object -First 1
-    if ($matchedPolicy) {
-        $policyId = $matchedPolicy.id
-        # Detect tier: a Vault-Standard AFS policy carries a vaultRetentionPolicy.
-        if ($null -eq $matchedPolicy.properties.vaultRetentionPolicy) {
-            Say "    Policy found - WARNING: '$policyName' looks Snapshot-only (not valid for ROC)" Yellow
-        } else {
-            Say "    Policy found (Vault-Standard)" Green
-        }
-    } else {
-        Say "    FAILED: Policy '$policyName' not found in vault" Red
-        $itemResult.Status = "FAILED"
-        $itemResult.Detail = "Policy '$policyName' not found"
-        return (Emit $itemResult)
-    }
-} catch {
-    Say "    FAILED: Could not query policies - $($_.Exception.Message)" Red
-    $itemResult.Status = "FAILED"
-    $itemResult.Detail = "Policy query error: $($_.Exception.Message)"
-    return (Emit $itemResult)
-}
-
-# STEP E: Enable protection (PUT)
-Say "  Step E: Enabling protection..." Cyan
-$containerNameEncoded = [System.Web.HttpUtility]::UrlEncode($containerName)
-$protectedItemNameEncoded = [System.Web.HttpUtility]::UrlEncode($protectedItemName)
-$enableProtectionUri = "https://management.azure.com/subscriptions/$vaultSubscriptionId/resourceGroups/$vaultResourceGroup/providers/Microsoft.RecoveryServices/vaults/$vaultName/backupFabrics/Azure/protectionContainers/$containerNameEncoded/protectedItems/$protectedItemNameEncoded`?api-version=$apiVersion"
-$protectionBody = @{
+# Step B: Register storage account (PUT)
+Say "  Step B: Registering storage account..." Cyan
+$registrationBody = @{
     properties = @{
-        protectedItemType = "AzureFileShareProtectedItem"
-        sourceResourceId  = $storageAccountResourceId
-        policyId          = $policyId
+        containerType = "StorageContainer"
+        sourceResourceId = $storageAccountResourceId
+        resourceGroup = $storageResourceGroup
+        friendlyName = $storageAccountName
+        backupManagementType = "AzureStorage"
     }
 } | ConvertTo-Json -Depth 10
 
-$protectionSucceeded = $false
+$registrationSucceeded = $false
 try {
-    Invoke-RestMethod -Uri $enableProtectionUri -Method PUT -Headers $headers -Body $protectionBody | Out-Null
-    Say "    Protection request submitted (200)" Green
-    $protectionSucceeded = $true
+    Invoke-RestMethod -Uri $containerUri -Method PUT -Headers $headers -Body $registrationBody | Out-Null
+    Say "    Registration request submitted (200)" Green
+    $registrationSucceeded = $true
 } catch {
     $putStatusCode = $_.Exception.Response.StatusCode.value__
     if ($putStatusCode -eq 202) {
-        Say "    Protection request accepted (202)" Green
-        $protectionSucceeded = $true
+        Say "    Registration request accepted (202)" Green
+        $registrationSucceeded = $true
     } else {
         $errorMsg = $_.Exception.Message
         try {
@@ -425,38 +355,40 @@ try {
     }
 }
 
-# STEP F: Verify protection state (poll)
-if ($protectionSucceeded) {
-    Say "  Step F: Verifying protection state..." Cyan
-    $maxRetries = 10
+# Step C: Verify registration status (poll)
+if ($registrationSucceeded) {
+    Say "  Step C: Verifying registration status..." Cyan
+    $maxRetries = 20
     $retryCount = 0
     $verified = $false
-    $finalState = "Unknown"
+    $finalStatus = "Unknown"
+
     while (-not $verified -and $retryCount -lt $maxRetries) {
-        Start-Sleep -Seconds 10
+        Start-Sleep -Seconds 6
         try {
-            $statusCheck = Invoke-RestRetry $enableProtectionUri "GET" $headers
-            $finalState = $statusCheck.properties.protectionState
-            if ($finalState -ne "Invalid") {
+            $statusCheck = Invoke-RestRetry $containerUri "GET" $headers
+            $finalStatus = $statusCheck.properties.registrationStatus
+            if ($finalStatus -eq "Registered") {
                 $verified = $true
-                Say "    Protection State: $finalState" Green
+                Say "    Registration Status: $finalStatus (Health: $($statusCheck.properties.healthStatus))" Green
             } else {
                 $retryCount++
-                Say "    Waiting... ($retryCount/$maxRetries) [State: $finalState]" Yellow
+                Say "    Waiting... ($retryCount/$maxRetries) [Status: $finalStatus]" Yellow
             }
         } catch {
             $retryCount++
             Say "    Polling... ($retryCount/$maxRetries)" Yellow
         }
     }
+
     if (-not $verified) {
         $itemResult.Status = "PENDING"
-        $itemResult.ProtectionState = $finalState
-        $itemResult.Detail = "PUT accepted, verification timed out. Verify on portal."
+        $itemResult.RegistrationStatus = $finalStatus
+        $itemResult.Detail = "Registration accepted, verification timed out. Verify on portal."
     } else {
         $itemResult.Status = "SUCCESS"
-        $itemResult.ProtectionState = $finalState
-        $itemResult.Detail = "Protected with policy '$policyName'"
+        $itemResult.RegistrationStatus = $finalStatus
+        $itemResult.Detail = "Registered to vault '$vaultName'"
     }
 }
 
@@ -469,7 +401,7 @@ return (Emit $itemResult)
 
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Yellow
-Write-Host "  Starting Bulk Protection Configuration" -ForegroundColor Yellow
+Write-Host "  Starting Bulk Storage Account Registration" -ForegroundColor Yellow
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host ""
 
@@ -516,7 +448,7 @@ $pendingCount = @($resArr | Where-Object { $_.Status -eq "PENDING" }).Count
 
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host "  Bulk Protection Configuration - Summary" -ForegroundColor Cyan
+Write-Host "  Bulk Storage Account Registration - Summary" -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host ""
 
@@ -532,13 +464,13 @@ Write-Host ""
 # Results table
 Write-Host "Results:" -ForegroundColor Yellow
 Write-Host ""
-Write-Host ("{0,-5} {1,-35} {2,-10} {3,-18} {4,-10} {5}" -f "#", "File Share", "Status", "Protection State", "Duration", "Detail") -ForegroundColor Cyan
-Write-Host ("{0,-5} {1,-35} {2,-10} {3,-18} {4,-10} {5}" -f ("-" * 5), ("-" * 35), ("-" * 10), ("-" * 18), ("-" * 10), ("-" * 35)) -ForegroundColor Gray
+Write-Host ("{0,-5} {1,-30} {2,-10} {3,-18} {4,-10} {5}" -f "#", "Storage Account", "Status", "Reg. Status", "Duration", "Detail") -ForegroundColor Cyan
+Write-Host ("{0,-5} {1,-30} {2,-10} {3,-18} {4,-10} {5}" -f ("-" * 5), ("-" * 30), ("-" * 10), ("-" * 18), ("-" * 10), ("-" * 35)) -ForegroundColor Gray
 
 $rowNum = 1
 foreach ($r in $resArr) {
     $statusColor = switch ($r.Status) { "SUCCESS" { "Green" } "FAILED" { "Red" } "SKIPPED" { "Yellow" } "PENDING" { "Yellow" } default { "White" } }
-    Write-Host ("{0,-5} {1,-35} {2,-10} {3,-18} {4,-10} {5}" -f $rowNum, $r.Item, $r.Status, $r.ProtectionState, $r.Duration, $r.Detail) -ForegroundColor $statusColor
+    Write-Host ("{0,-5} {1,-30} {2,-10} {3,-18} {4,-10} {5}" -f $rowNum, $r.Item, $r.Status, $r.RegistrationStatus, $r.Duration, $r.Detail) -ForegroundColor $statusColor
     $rowNum++
 }
 
@@ -546,21 +478,27 @@ Write-Host ""
 
 # Export results to CSV
 $outputCsvPath = $CsvPath -replace '\.csv$', '_Results.csv'
-$resArr | Select-Object Item, Vault, Policy, Status, ProtectionState, Detail, Duration | Export-Csv -Path $outputCsvPath -NoTypeInformation -Force
+$resArr | Select-Object Item, ResourceGroup, Vault, Status, RegistrationStatus, Detail, Duration | Export-Csv -Path $outputCsvPath -NoTypeInformation -Force
 Write-Host "Results exported to: $outputCsvPath" -ForegroundColor Gray
 Write-Host ""
 
 if ($failedCount -gt 0) {
     Write-Host "WARNING: $failedCount item(s) failed. Check the results above for details." -ForegroundColor Yellow
     Write-Host "Possible causes:" -ForegroundColor Yellow
-    Write-Host "  1. Storage account not registered to vault" -ForegroundColor White
-    Write-Host "  2. File share doesn't exist in storage account" -ForegroundColor White
-    Write-Host "  3. Insufficient permissions" -ForegroundColor White
-    Write-Host "  4. Policy incompatible with file share type" -ForegroundColor White
+    Write-Host "  1. Storage account is already registered to another vault" -ForegroundColor White
+    Write-Host "  2. Insufficient permissions on storage account or vault" -ForegroundColor White
+    Write-Host "  3. Storage account doesn't exist or resource ID is incorrect" -ForegroundColor White
+    Write-Host "  4. Cross-subscription registration not permitted by policy" -ForegroundColor White
     Write-Host ""
 }
 
+Write-Host "Next Steps:" -ForegroundColor Yellow
+Write-Host "  1. Configure backup protection for the file shares in these storage accounts" -ForegroundColor White
+Write-Host "  2. Use Configure-FileShare-Protection.ps1 (single) or" -ForegroundColor White
+Write-Host "     Bulk-Configure-FileShare-Protection.ps1 (bulk) with a Vault-Standard policy" -ForegroundColor White
+Write-Host ""
+
 Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host "  Bulk Protection Script Execution Completed" -ForegroundColor Cyan
+Write-Host "  Bulk Registration Script Execution Completed" -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host ""

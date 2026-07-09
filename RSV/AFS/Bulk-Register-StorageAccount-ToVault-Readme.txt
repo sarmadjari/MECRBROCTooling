@@ -1,24 +1,28 @@
 ================================================================================
-  Bulk-Configure-FileShare-Protection.ps1 - README
+  Bulk-Register-StorageAccount-ToVault.ps1 - README
 ================================================================================
 
 DESCRIPTION
 -----------
-Bulk enables backup protection for multiple Azure File Shares from a CSV file
-using the Azure Backup REST API. Uses the same per-item flow as
-Configure-FileShare-Protection.ps1.
+Bulk registers multiple Azure Storage Accounts (containing Azure File Shares) to
+a Recovery Services Vault from a CSV file using the Azure Backup REST API. Uses
+the same per-item flow as Register-StorageAccount-ToVault.ps1.
+
+Registration is the FIRST step before configuring file share backup protection.
+Once a storage account is registered, its file shares can be protected with
+Configure-FileShare-Protection.ps1 (single) or
+Bulk-Configure-FileShare-Protection.ps1 (bulk).
 
 Per-item steps:
-  1. Verifies storage account is registered to the vault.
-  2. Triggers inquire to discover file shares in the storage account.
-  3. Lists protectable items and verifies the target file share exists.
-  4. Finds the backup policy by name in the vault.
-  5. Enables protection (PUT).
-  6. Polls/verifies protection state (SUCCESS, PENDING, or FAILED).
+  1. Refreshes container discovery for the vault (done once per unique vault).
+  2. Checks current registration status (skips if already Registered).
+  3. Registers the storage account to the vault (PUT).
+  4. Polls/verifies registration status (SUCCESS, PENDING, or FAILED).
 
 Additional features:
   - Preview table of all items before execution.
-  - Policy tier caution (Snapshot vs Vault-Standard) displayed before confirm.
+  - Idempotent: storage accounts already registered are SKIPPED, not re-registered.
+  - Discovery refresh runs only once per unique vault (efficient for large CSVs).
   - Per-item duration tracking.
   - Summary table with SUCCESS / FAILED / PENDING / SKIPPED counts.
   - Results exported to a _Results.csv file.
@@ -28,17 +32,18 @@ PARALLELISM
 -----------
 The script processes CSV rows concurrently, bounded by -MaxParallel:
 
-  -MaxParallel <n>   Maximum file shares to configure at once. Default 5 (matches
-                     the AFS "5 file shares at a time" guidance). Use 1 to force
-                     sequential processing.
+  -MaxParallel <n>   Maximum storage accounts to register at once. Default 5.
+                     Use 1 to force sequential processing.
 
   - Parallel execution requires PowerShell 7+. On Windows PowerShell 5.1 the
     script automatically falls back to SEQUENTIAL (the -MaxParallel value is
     ignored, with a notice).
+  - Container discovery is refreshed ONCE per unique vault up front (before the
+    parallel loop), so concurrent workers do not repeat it.
   - REST calls retry automatically with backoff on HTTP 429 (throttling).
   - The chosen mode (PARALLEL / SEQUENTIAL) is printed before the run starts.
   - In parallel mode, per-item log lines are prefixed with [i/total] so the
-    interleaved output stays attributable to each file share.
+    interleaved output stays attributable to each storage account.
 
 How -MaxParallel works (technically):
   - It maps directly to ForEach-Object -Parallel -ThrottleLimit <n> in
@@ -51,21 +56,9 @@ How -MaxParallel works (technically):
   - Runspaces are isolated; they share only the auth token/headers and a
     thread-safe results collection. Counts are tallied after all items complete.
   - Parallelism overlaps the WAITING (REST round-trips + status polling); it does
-    not make Azure's server-side backup itself run faster.
+    not make Azure's server-side registration itself run faster.
   - Higher values mean more simultaneous REST calls and higher HTTP 429
     (throttling) risk, which is why the default is a conservative 5.
-  - If you need STRICT batches (fully finish 5 before starting the next 5),
-    split the CSV into files of 5 rows and run them one after another.
-
-
-CAUTION — Policy Tier Behavior:
-  - 'Snapshot' policy       : Backups are stored as snapshots in the Storage
-                              Account only, in the Storage Account region.
-  - 'Vault-Standard' policy : Backups are stored as snapshots in the Storage
-                              Account (Storage Account region) and transferred
-                              to the Recovery Services Vault (Vault region).
-  Verify your policy tier in Azure Portal (Recovery Services Vault -> Backup
-  Policies -> Select Policy -> look for 'Backup tier') before running.
 
 
 WHERE TO RUN
@@ -95,11 +88,12 @@ REQUIRED PERMISSIONS (RBAC)
 ---------------------------
 - Backup Contributor (or equivalent) on the Recovery Services Vault.
 - Reader (or equivalent) on the Storage Account(s).
+- For cross-subscription registration, the above on the respective subscriptions.
 
 
 CSV FORMAT
 ----------
-File: Bulk-Configure-FileShare-Protection_Input.csv
+File: Bulk-Register-StorageAccount-ToVault_Input.csv
 
   Header row required. Columns:
     VaultSubscriptionId              Subscription ID of the Recovery Services Vault
@@ -109,77 +103,75 @@ File: Bulk-Configure-FileShare-Protection_Input.csv
                                      (leave empty to use vault subscription)
     StorageAccountResourceGroup      Resource group of the storage account
     StorageAccountName               Name of the storage account
-    FileShareName                    Name of the file share to protect
-    PolicyName                       Name of the backup policy to assign
 
   Example:
-    VaultSubscriptionId,VaultResourceGroup,VaultName,StorageAccountSubscriptionId,StorageAccountResourceGroup,StorageAccountName,FileShareName,PolicyName
-    aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee,rg-backup-prod,rsv-prod-eastus,,rg-storage-prod,stgfileshare01,data-share,DailyPolicy-30d
-    aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee,rg-backup-prod,rsv-prod-eastus,,rg-storage-prod,stgfileshare01,logs-share,DailyPolicy-30d
+    VaultSubscriptionId,VaultResourceGroup,VaultName,StorageAccountSubscriptionId,StorageAccountResourceGroup,StorageAccountName
+    aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee,rg-backup-prod,rsv-prod-eastus,,rg-storage-prod,stgfileshare01
+    aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee,rg-backup-prod,rsv-prod-eastus,,rg-storage-prod,stgfileshare02
 
 
 HOW TO RUN
 ----------
   With parameter:
-    .\Bulk-Configure-FileShare-Protection.ps1 -CsvPath "C:\inputs\fileshares.csv"
+    .\Bulk-Register-StorageAccount-ToVault.ps1 -CsvPath "C:\inputs\storageaccounts.csv"
 
   With parallelism control (default 5):
-    .\Bulk-Configure-FileShare-Protection.ps1 -CsvPath ".\fileshares.csv" -MaxParallel 5
+    .\Bulk-Register-StorageAccount-ToVault.ps1 -CsvPath ".\storageaccounts.csv" -MaxParallel 5
 
   Sequential (one at a time):
-    .\Bulk-Configure-FileShare-Protection.ps1 -CsvPath ".\fileshares.csv" -MaxParallel 1
+    .\Bulk-Register-StorageAccount-ToVault.ps1 -CsvPath ".\storageaccounts.csv" -MaxParallel 1
 
   Without parameter (prompts or uses default):
-    .\Bulk-Configure-FileShare-Protection.ps1
+    .\Bulk-Register-StorageAccount-ToVault.ps1
 
-  The default CSV path is Bulk-Configure-FileShare-Protection_Input.csv in the
+  The default CSV path is Bulk-Register-StorageAccount-ToVault_Input.csv in the
   same directory as the script.
 
 
 API VERSION USED
 ----------------
-  - 2025-08-01   All operations (container verification, inquire, protectable
-                 items, policies, enable protection)
+  - 2025-08-01   All operations (refresh discovery, container status, registration)
 
 
 RESULT STATUSES
 ---------------
-  SUCCESS  — Protection PUT accepted and verification confirmed a valid state
-             (Protected or IRPending).
-  PENDING  — Protection PUT accepted but verification timed out. The protection
-             is likely configured; verify on Azure Portal.
-  FAILED   — An error occurred (registration missing, policy not found, PUT
-             failed, etc.). Detail column shows the specific error.
-  SKIPPED  — Missing required fields in the CSV row.
+  SUCCESS  — Registration PUT accepted and verification confirmed status
+             'Registered'.
+  PENDING  — Registration PUT accepted but verification timed out. The
+             registration is likely complete; verify on Azure Portal.
+  FAILED   — An error occurred (storage account already registered to another
+             vault, insufficient permissions, invalid resource ID, etc.). The
+             Detail column shows the specific error.
+  SKIPPED  — Storage account is already registered to the vault, OR the CSV row
+             is missing required fields.
 
-  Note: 'IRPending' (Initial Recovery Pending) means protection is configured
-  and the first backup is pending.
 
 EXAMPLES
 --------
 
-Example 1 — Bulk protect multiple file shares (same region)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  PS> .\Bulk-Configure-FileShare-Protection.ps1 -CsvPath ".\my-fileshares.csv"
+Example 1 — Bulk register multiple storage accounts (same region)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  PS> .\Bulk-Register-StorageAccount-ToVault.ps1 -CsvPath ".\my-storageaccounts.csv"
 
-  The script loads the CSV, previews all items in a table, shows the policy
-  tier caution, asks for confirmation, then processes each item sequentially.
+  The script loads the CSV, previews all items in a table, asks for
+  confirmation, then processes each item sequentially.
 
 
 Example 2 — Use default CSV file
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  PS> .\Bulk-Configure-FileShare-Protection.ps1
+  PS> .\Bulk-Register-StorageAccount-ToVault.ps1
 
   Prompts for CSV path. Press Enter to use the default
-  Bulk-Configure-FileShare-Protection_Input.csv in the script directory.
+  Bulk-Register-StorageAccount-ToVault_Input.csv in the script directory.
 
 
 Example 3 — Cross-region (storage in UAE North, vault in Sweden Central)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  CSV rows can reference storage accounts in different regions than the vault.
+  CSV rows can reference storage accounts in different regions/subscriptions
+  than the vault (the Region-of-Choice scenario).
 
   Example CSV row:
-    aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee,rg-backup-swedencentral,rsv-dr-swedencentral,,rg-storage-uaenorth,stgfilesuaenorth01,finance-data,DailyPolicy-30d
+    aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee,rg-backup-swedencentral,rsv-dr-swedencentral,,rg-storage-uaenorth,stgfilesuaenorth01
 
   The storage account is in UAE North (uaenorth) while the vault is in
   Sweden Central (swedencentral).
@@ -188,7 +180,7 @@ Example 3 — Cross-region (storage in UAE North, vault in Sweden Central)
 Example 4 — Using Azure CLI for authentication
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   PS> az login
-  PS> .\Bulk-Configure-FileShare-Protection.ps1 -CsvPath ".\my-fileshares.csv"
+  PS> .\Bulk-Register-StorageAccount-ToVault.ps1 -CsvPath ".\my-storageaccounts.csv"
 
   If Azure PowerShell (Az module) is not installed, the script
   automatically falls back to Azure CLI for token acquisition.
@@ -198,14 +190,14 @@ OUTPUT
 ------
 Console output:
   - Preview table of all items
-  - Per-item step-by-step progress (Steps A through F)
+  - Per-item step-by-step progress (Steps A through D)
   - Color-coded results: Green (SUCCESS), Red (FAILED), Yellow (PENDING/SKIPPED)
   - Summary metrics: total, succeeded, failed, pending, skipped, total duration
   - Results table
 
 Results CSV:
   - Exported to {InputFileName}_Results.csv
-  - Columns: Item, Vault, Policy, Status, ProtectionState, Detail, Duration
+  - Columns: Item, ResourceGroup, Vault, Status, RegistrationStatus, Detail, Duration
 
 
 ERROR HANDLING
@@ -213,22 +205,33 @@ ERROR HANDLING
 Per-item errors are caught and logged — they do not stop the script.
 
 Common per-item failures:
-  - Storage account not registered to vault
-  - File share not found in protectable items
-  - Policy name not found in vault
-  - PUT returns non-200/202 error (insufficient permissions, policy
-    incompatible with file share type)
+  - Storage account already registered to a DIFFERENT vault (a storage account
+    can only be registered to one vault at a time)
+  - Insufficient permissions on storage account or vault
+  - Storage account does not exist or the resource ID is incorrect
+  - Cross-subscription registration blocked by policy
 
 The script continues to the next CSV row after any failure.
 
 
+WORKFLOW CONTEXT
+----------------
+Registration is step 1 of the Azure Files backup workflow:
+
+  1. Bulk-Register-StorageAccount-ToVault.ps1   <-- (this script)
+  2. Bulk-Configure-FileShare-Protection.ps1    (protect the file shares)
+
+  For Cross-Region Backup (ROC), configure protection with a 'Vault-Standard'
+  policy and protect file shares in batches of 5 at a time.
+
+
 PUBLIC DOCUMENTATION
 --------------------
-  Protected Items - Create or Update (REST API reference):
-    https://learn.microsoft.com/en-us/rest/api/backup/protected-items/create-or-update?view=rest-backup-2025-08-01
-
   Back up Azure File Shares with REST API:
     https://learn.microsoft.com/en-us/azure/backup/backup-azure-file-share-rest-api
+
+  Protection Containers - Register (REST API reference):
+    https://learn.microsoft.com/en-us/rest/api/backup/protection-containers/register
 
   Azure REST API Authentication (Bearer token):
     https://learn.microsoft.com/en-us/rest/api/azure/#create-the-request

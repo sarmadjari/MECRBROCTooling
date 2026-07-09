@@ -1,0 +1,4 @@
+VaultSubscriptionId,VaultResourceGroup,VaultName,StorageAccountSubscriptionId,StorageAccountResourceGroup,StorageAccountName
+aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee,rg-backup-prod,rsv-prod-eastus,,rg-storage-prod,stgfileshare01
+aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee,rg-backup-prod,rsv-prod-eastus,,rg-storage-prod,stgfileshare02
+aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee,rg-backup-swedencentral,rsv-dr-swedencentral,,rg-storage-uaenorth,stgfilesuaenorth01

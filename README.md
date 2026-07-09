@@ -145,12 +145,24 @@ Classic backup model on the `Microsoft.RecoveryServices` provider. Most scripts 
 
 Protect with the **`Vault-Standard`** policy, in batches of **5 shares**.
 
+The AFS workflow is three stages — **Register → Configure → Restore** — each available as a single-item script and a CSV-driven **bulk** script.
+
 | Script | Purpose |
 |--------|---------|
-| `Register-StorageAccount-ToVault.ps1` / `Unregister-StorageAccount-FromVault.ps1` | Register / unregister a storage account to/from a vault. |
-| `Configure-FileShare-Protection.ps1` / `Stop-FileShare-Protection.ps1` | Configure / stop protection for a single file share. |
-| `Bulk-Configure-FileShare-Protection.ps1` / `Bulk-Stop-FileShare-Protection.ps1` | CSV-driven bulk configure / stop (see the `*_Input.csv` templates). |
-| `Restore-AzureFileShare-RestAPI.ps1` | Restore an Azure file share. |
+| `Register-StorageAccount-ToVault.ps1` / `Unregister-StorageAccount-FromVault.ps1` | Register / unregister a **single** storage account to/from a vault. |
+| `Bulk-Register-StorageAccount-ToVault.ps1` | CSV-driven **bulk** register of many storage accounts (idempotent — skips already-registered). |
+| `Configure-FileShare-Protection.ps1` / `Stop-FileShare-Protection.ps1` | Configure / stop protection for a **single** file share. |
+| `Bulk-Configure-FileShare-Protection.ps1` / `Bulk-Stop-FileShare-Protection.ps1` | CSV-driven **bulk** configure / stop protection. |
+| `Restore-AzureFileShare-RestAPI.ps1` | Restore a **single** Azure file share (interactive). |
+| `Bulk-Restore-AzureFileShare-RestAPI.ps1` | CSV-driven **bulk** restore (Full-Share / Item-Level, ALR / original, latest or named recovery point). |
+
+Each bulk script (`Bulk-Register`, `Bulk-Configure`, `Bulk-Restore`) takes a matching `*_Input.csv`, previews the batch, asks for one confirmation, processes rows, and exports a `*_Results.csv`. They support **bounded parallelism** via `-MaxParallel` (default **5**, honoring the AFS "5 at a time" rule) on PowerShell 7+, with automatic **sequential fallback on Windows PowerShell 5.1** and HTTP‑429 retry/backoff. Use `-MaxParallel 1` to force sequential. Example:
+
+```powershell
+.\Bulk-Configure-FileShare-Protection.ps1 -CsvPath .\shares.csv -MaxParallel 5
+```
+
+**How `-MaxParallel` works:** it maps to `ForEach-Object -Parallel -ThrottleLimit <n>` — each row runs in its own isolated runspace (a thread in the same process), and the value is a **rolling cap** of how many run at once, *not* a fixed batch: as soon as one row finishes, the next queued row starts, keeping ~`n` in flight. It overlaps the client-side **waiting** (REST calls + status polling) — it does not speed up Azure's server-side copy — and higher values raise memory use and 429 throttling risk. If you need *strict* batches (finish 5 fully before starting the next 5), split the CSV into files of 5 rows. See each bulk script's `*-Readme.txt` for the full "How -MaxParallel works" notes.
 
 #### `RSV/IaaSVM/` — Azure IaaS VMs
 
