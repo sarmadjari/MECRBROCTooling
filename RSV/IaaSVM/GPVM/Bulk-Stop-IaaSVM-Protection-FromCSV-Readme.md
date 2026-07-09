@@ -1,5 +1,7 @@
 # Bulk Stop IaaS VM Protection (Retain Data) — README
 
+> Part of the [MECRBROCTooling](../../../README.md) Cross-Region Backup (ROC) toolkit — `RSV/IaaSVM/GPVM`.
+
 ## Overview
 
 **Bulk-Stop-IaaSVM-Protection-FromCSV.ps1** is a PowerShell script that batch-stops backup protection for Azure IaaS Virtual Machines while retaining existing backup data. It reads a CSV file with vault and VM resource IDs and processes each row via the Azure Backup REST API.

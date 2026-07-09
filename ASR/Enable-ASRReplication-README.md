@@ -1,5 +1,7 @@
 # Enable-ASRReplication.ps1
 
+> Part of the [MECRBROCTooling](../README.md) Cross-Region Backup (ROC) toolkit — `ASR` (disaster-recovery replication).
+
 Automates Azure Site Recovery (A2A) replication for multiple Azure VMs using the **Create Protection Intent** REST API. The script handles all setup — vault, policy, automation account, virtual network — so you can go from zero to protected with a single command.
 
 ---

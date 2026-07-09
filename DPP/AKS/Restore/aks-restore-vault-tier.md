@@ -1,5 +1,7 @@
 # AKS Restore from Vault Tier
 
+> Part of the [MECRBROCTooling](../../../README.md) Cross-Region Backup (ROC) toolkit — `DPP/AKS`.
+
 PowerShell script to perform an AKS restore from a vault-tier recovery point. The script supports restoring to **any target region** — including cross-region restore (CRR) to a different region **and** restore back to the vault's own region.
 
 Additionally supports namespace remapping, conflict policies, and PV restore mode selection. The script handles permission setup (trusted access, role assignments), restore configuration, validation, trigger, and job polling.

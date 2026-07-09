@@ -1,5 +1,7 @@
 # Bulk Register IaaS VM to Recovery Services Vault — README
 
+> Part of the [MECRBROCTooling](../../../README.md) Cross-Region Backup (ROC) toolkit — `RSV/IaaSVM/GPVM`.
+
 ## Overview
 
 **Bult-Register-IaaSVM-FromCSV.ps1** is a PowerShell script that batch-protects Azure IaaS Virtual Machines to Recovery Services Vaults using a CSV file as input. For each VM, it checks whether protection is already enabled and, if not, enables backup protection with the specified policy — all via Azure Backup REST API.

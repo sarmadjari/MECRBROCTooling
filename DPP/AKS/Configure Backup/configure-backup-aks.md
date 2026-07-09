@@ -1,5 +1,7 @@
 # Configure AKS Backup E2E Script
 
+> Part of the [MECRBROCTooling](../../../README.md) Cross-Region Backup (ROC) toolkit — `DPP/AKS`.
+
 PowerShell script to configure AKS backup end-to-end using standard `az dataprotection` CLI commands. Creates a backup vault with cross-region backup, creates a vault-tier policy, installs the backup extension, assigns permissions, and configures the backup instance.
 
 > **Note:** You must have **Owner** or **Contributor + User Access Administrator** role on the subscription. The script assigns roles to vault MSI, cluster MSI, and extension MSI identities.
