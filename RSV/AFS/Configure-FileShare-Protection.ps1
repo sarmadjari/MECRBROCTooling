@@ -377,97 +377,159 @@ Write-Host "Retrieving available backup policies..." -ForegroundColor Cyan
 
 $policiesUri = "https://management.azure.com/subscriptions/$vaultSubscriptionId/resourceGroups/$vaultResourceGroup/providers/Microsoft.RecoveryServices/vaults/$vaultName/backupPolicies?api-version=$apiVersion&`$filter=backupManagementType eq 'AzureStorage'"
 
+# ---------------------------------------------------------------------------
+# PATCH (2026-07-09): Robust Azure File Share policy detection.
+#
+# WHY THIS WAS PATCHED:
+#   The original STEP 4 reported "No backup policies found for Azure File
+#   Shares" even when a valid AzureStorage policy (e.g. 'AFSdailyBackup')
+#   clearly existed in the vault. Two fragilities caused this false negative:
+#     1. When the REST list returned a SINGLE policy, $policiesResponse.value
+#        was unwrapped to a scalar object, so the "$x -and $x.Count -gt 0"
+#        guards evaluated incorrectly and the valid policy was discarded.
+#     2. The backupPolicies list view can return items WITHOUT the nested
+#        'properties' object, so filtering on
+#        $_.properties.backupManagementType matched nothing.
+#
+# FIX:
+#     - Always wrap results in @() before counting so a single policy is still
+#       treated as a collection.
+#     - Re-fetch (GET by name) the full policy definition whenever a list item
+#       is missing 'properties', so backupManagementType is always evaluable.
+#     - Added a Vault-Standard tier check. Cross-Region Backup (ROC) for Azure
+#       Files REQUIRES a Vault-Standard policy; a Snapshot-only policy keeps
+#       data in the source region and is NOT valid for ROC. The tier is now
+#       shown per policy and a warning is raised if a Snapshot-only policy is
+#       selected.
+# ---------------------------------------------------------------------------
 try {
     $policiesResponse = Invoke-RestMethod -Uri $policiesUri -Method GET -Headers $headers
-    
-    if ($policiesResponse.value -and $policiesResponse.value.Count -gt 0) {
-        # Filter for Azure File Share policies
-        $fileSharePolicies = $policiesResponse.value | Where-Object {
-            $_.properties.backupManagementType -eq "AzureStorage"
-        }
-        
-        if ($fileSharePolicies -and $fileSharePolicies.Count -gt 0) {
-            Write-Host "  Found $($fileSharePolicies.Count) backup policy/policies for Azure File Shares" -ForegroundColor Green
-            Write-Host ""
-            
-            Write-Host "Available Backup Policies:" -ForegroundColor Cyan
-            
-            $policyIndex = 1
-            $policyMap = @{}
-            
-            foreach ($policy in $fileSharePolicies) {
-                $policyName = $policy.name
-                $schedulePolicy = $policy.properties.schedulePolicy
-                $retentionPolicy = $policy.properties.retentionPolicy
-                
-                Write-Host "  [$policyIndex] $policyName" -ForegroundColor White
-                
-                # Display schedule details if available
-                if ($schedulePolicy) {
-                    Write-Host "      Schedule: $($schedulePolicy.scheduleRunFrequency)" -ForegroundColor Gray
-                    if ($schedulePolicy.scheduleRunTimes) {
-                        $time = $schedulePolicy.scheduleRunTimes[0]
-                        Write-Host "      Time: $time" -ForegroundColor Gray
-                    }
-                }
-                
-                # Display retention details if available
-                if ($retentionPolicy -and $retentionPolicy.dailySchedule) {
-                    $days = $retentionPolicy.dailySchedule.retentionDuration.count
-                    Write-Host "      Retention: $days days" -ForegroundColor Gray
-                }
-                
-                Write-Host ""
-                
-                $policyMap[$policyIndex] = $policy
-                $policyIndex++
-            }
-            
-            # Caution: Policy tier behavior
-            Write-Host "  CAUTION:" -ForegroundColor DarkYellow
-            Write-Host "    - 'Snapshot' policy       : Backups are stored as snapshots in the Storage Account only, in the Storage Account region." -ForegroundColor DarkYellow
-            Write-Host "    - 'Vault-Standard' policy : Backups are stored as snapshots in the Storage Account (Storage Account region) and transferred to the Recovery Services Vault (Vault region)." -ForegroundColor DarkYellow
-            Write-Host "    Please verify your policy tier in the Azure Portal (Recovery Services Vault > Backup Policies > Select Policy and look for 'Backup tier') before selecting." -ForegroundColor DarkYellow
-            Write-Host ""
-            
-            # User selects policy
-            Write-Host "Select a backup policy (enter number):" -ForegroundColor Cyan
-            $selectedPolicyIndex = Read-Host "  Enter policy number"
-            
-            try {
-                $selectedPolicyIndexInt = [int]$selectedPolicyIndex
-                
-                if ($policyMap.ContainsKey($selectedPolicyIndexInt)) {
-                    $selectedPolicy = $policyMap[$selectedPolicyIndexInt]
-                    $policyId = $selectedPolicy.id
-                    $policyName = $selectedPolicy.name
-                    
-                    Write-Host "  Selected: $policyName" -ForegroundColor Green
-                    Write-Host "  Policy ID: $policyId" -ForegroundColor Gray
-                    Write-Host ""
-                } else {
-                    Write-Host "ERROR: Invalid policy selection." -ForegroundColor Red
-                    exit 1
-                }
-            } catch {
-                Write-Host "ERROR: Invalid input. Please enter a number." -ForegroundColor Red
-                exit 1
-            }
-        } else {
-            Write-Host ""
-            Write-Host "ERROR: No backup policies found for Azure File Shares." -ForegroundColor Red
-            Write-Host ""
-            Write-Host "Please create a backup policy in the vault first." -ForegroundColor Yellow
-            Write-Host "You can create policies via Azure Portal or using Azure PowerShell/CLI." -ForegroundColor Yellow
-            Write-Host ""
-            exit 1
-        }
-    } else {
+
+    # Wrap in @() so a single-policy response is still treated as a collection.
+    $allPolicies = @($policiesResponse.value)
+
+    if ($allPolicies.Count -eq 0) {
         Write-Host ""
-        Write-Host "ERROR: No backup policies found in vault." -ForegroundColor Red
+        Write-Host "ERROR: No backup policies found in vault '$vaultName'." -ForegroundColor Red
         Write-Host ""
         Write-Host "Please create a backup policy in the vault first." -ForegroundColor Yellow
         Write-Host ""
+        exit 1
+    }
+
+    # Hydrate any policy whose list view is missing the nested 'properties'
+    # object by GET-ing the full definition by name.
+    $hydratedPolicies = @(
+        foreach ($p in $allPolicies) {
+            if ($p.properties -and $p.properties.backupManagementType) {
+                $p
+            } else {
+                $singlePolicyUri = "https://management.azure.com/subscriptions/$vaultSubscriptionId/resourceGroups/$vaultResourceGroup/providers/Microsoft.RecoveryServices/vaults/$vaultName/backupPolicies/$($p.name)?api-version=$apiVersion"
+                try { Invoke-RestMethod -Uri $singlePolicyUri -Method GET -Headers $headers }
+                catch { $p }   # fall back to the list item if the GET fails
+            }
+        }
+    )
+
+    # Keep only Azure File Share (AzureStorage) policies.
+    $fileSharePolicies = @(
+        $hydratedPolicies | Where-Object { $_.properties.backupManagementType -eq "AzureStorage" }
+    )
+
+    if ($fileSharePolicies.Count -eq 0) {
+        Write-Host ""
+        Write-Host "ERROR: No Azure File Share (AzureStorage) backup policies found in vault '$vaultName'." -ForegroundColor Red
+        Write-Host ""
+        Write-Host "Policies present in the vault:" -ForegroundColor Yellow
+        foreach ($p in $hydratedPolicies) {
+            Write-Host ("    - {0} ({1})" -f $p.name, $p.properties.backupManagementType) -ForegroundColor Gray
+        }
+        Write-Host ""
+        Write-Host "Create an Azure File Share 'Vault-Standard' policy in the vault first." -ForegroundColor Yellow
+        Write-Host ""
+        exit 1
+    }
+
+    Write-Host "  Found $($fileSharePolicies.Count) backup policy/policies for Azure File Shares" -ForegroundColor Green
+    Write-Host ""
+
+    Write-Host "Available Backup Policies:" -ForegroundColor Cyan
+
+    $policyIndex = 1
+    $policyMap = @{}
+
+    foreach ($policy in $fileSharePolicies) {
+        $policyName = $policy.name
+        $schedulePolicy = $policy.properties.schedulePolicy
+        $retentionPolicy = $policy.properties.retentionPolicy
+
+        # Detect backup tier: a Vault-Standard AFS policy carries a
+        # 'vaultRetentionPolicy'; a Snapshot-only policy does not. ROC requires
+        # Vault-Standard, so surface the tier next to each policy.
+        $isVaultStandard = $null -ne $policy.properties.vaultRetentionPolicy
+        $tierLabel = if ($isVaultStandard) { "Vault-Standard (valid for ROC)" } else { "Snapshot-only (NOT valid for ROC)" }
+        $tierColor = if ($isVaultStandard) { "Green" } else { "Red" }
+
+        Write-Host "  [$policyIndex] $policyName" -ForegroundColor White
+        Write-Host "      Backup tier: $tierLabel" -ForegroundColor $tierColor
+
+        # Display schedule details if available
+        if ($schedulePolicy) {
+            Write-Host "      Schedule: $($schedulePolicy.scheduleRunFrequency)" -ForegroundColor Gray
+            if ($schedulePolicy.scheduleRunTimes) {
+                $time = $schedulePolicy.scheduleRunTimes[0]
+                Write-Host "      Time: $time" -ForegroundColor Gray
+            }
+        }
+
+        # Display retention details if available
+        if ($retentionPolicy -and $retentionPolicy.dailySchedule) {
+            $days = $retentionPolicy.dailySchedule.retentionDuration.count
+            Write-Host "      Retention: $days days" -ForegroundColor Gray
+        }
+
+        Write-Host ""
+
+        $policyMap[$policyIndex] = $policy
+        $policyIndex++
+    }
+
+    # Caution: Policy tier behavior
+    Write-Host "  CAUTION:" -ForegroundColor DarkYellow
+    Write-Host "    - 'Snapshot' policy       : Backups are stored as snapshots in the Storage Account only, in the Storage Account region." -ForegroundColor DarkYellow
+    Write-Host "    - 'Vault-Standard' policy : Backups are stored as snapshots in the Storage Account (Storage Account region) and transferred to the Recovery Services Vault (Vault region)." -ForegroundColor DarkYellow
+    Write-Host "    Cross-Region Backup (ROC) REQUIRES a 'Vault-Standard' policy." -ForegroundColor DarkYellow
+    Write-Host ""
+
+    # User selects policy
+    Write-Host "Select a backup policy (enter number):" -ForegroundColor Cyan
+    $selectedPolicyIndex = Read-Host "  Enter policy number"
+
+    try {
+        $selectedPolicyIndexInt = [int]$selectedPolicyIndex
+
+        if ($policyMap.ContainsKey($selectedPolicyIndexInt)) {
+            $selectedPolicy = $policyMap[$selectedPolicyIndexInt]
+            $policyId = $selectedPolicy.id
+            $policyName = $selectedPolicy.name
+
+            Write-Host "  Selected: $policyName" -ForegroundColor Green
+            Write-Host "  Policy ID: $policyId" -ForegroundColor Gray
+
+            # Warn (do not block) if a Snapshot-only policy was chosen: it will
+            # not create cross-region (vault-tier) recovery points.
+            if ($null -eq $selectedPolicy.properties.vaultRetentionPolicy) {
+                Write-Host ""
+                Write-Host "  WARNING: '$policyName' is a Snapshot-only policy. It will NOT create" -ForegroundColor Red
+                Write-Host "           vault-tier (cross-region) backups. For ROC, use a Vault-Standard policy." -ForegroundColor Red
+            }
+            Write-Host ""
+        } else {
+            Write-Host "ERROR: Invalid policy selection." -ForegroundColor Red
+            exit 1
+        }
+    } catch {
+        Write-Host "ERROR: Invalid input. Please enter a number." -ForegroundColor Red
         exit 1
     }
 } catch {
