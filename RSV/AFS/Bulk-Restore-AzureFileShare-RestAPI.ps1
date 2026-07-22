@@ -26,6 +26,19 @@
     - Set -MaxParallel 1 to force sequential processing on any version.
     - REST calls include automatic retry/backoff on HTTP 429 (throttling).
 
+    STRICT-CSV PHILOSOPHY / AUTOMATION SWITCHES:
+    By default the script follows the CSV 100% and expects the target environment
+    to be ready. Rows that do not meet a precondition are SKIPPED and clearly
+    reported - the script never guesses:
+      * Empty TargetFileShareName             -> row SKIPPED
+      * Target file share does not exist      -> row SKIPPED
+    Two opt-in switches automate those preconditions:
+      * -UseSourceNameIfEmpty       : empty TargetFileShareName cells use the
+                                      SOURCE share name as the destination name
+      * -CreateTargetShareIfMissing : missing target shares are created
+                                      automatically before the restore
+    Use both switches together for fully automated destination handling.
+
     Important Support Notes (AFS Vaulted Policy):
     1. Only ALR (Alternate Location) restore is released in production. ILR and OLR are not.
     2. The target folder name during restore has to be empty (restore to root).
@@ -47,7 +60,13 @@
         TargetStorageAccountSubscriptionId   - Subscription ID of the TARGET storage account (empty = source subscription) [ALR only]
         TargetStorageAccountResourceGroup    - Resource group of the target storage account [ALR only]
         TargetStorageAccountName             - Name of the target storage account [ALR only]
-        TargetFileShareName                  - Name of the target file share [ALR only]
+        TargetFileShareName                  - Name of the target file share [ALR only - REQUIRED;
+                                               rows with an empty value are SKIPPED and reported,
+                                               unless -UseSourceNameIfEmpty is specified, in which
+                                               case the SOURCE share name is used instead.
+                                               The share must already exist in the target storage
+                                               account, unless -CreateTargetShareIfMissing is
+                                               specified, in which case it is created automatically]
         TargetFolderPath                     - Optional target folder (empty = root) [ALR only]
         ItemPaths                            - Semicolon-separated paths for ItemLevelRestore,
                                                each "File:path" or "Folder:path" (e.g. "File:reports/q4.xlsx;Folder:logs/")
@@ -75,6 +94,18 @@
     Maximum number of restores to run concurrently (default 5). Requires PowerShell 7+;
     on Windows PowerShell 5.1 the script runs sequentially. Use 1 to force sequential.
 
+.PARAMETER UseSourceNameIfEmpty
+    Opt-in. When specified, AlternateLocation rows with an empty TargetFileShareName
+    use the SOURCE file share name as the destination share name.
+    Without this switch the CSV is followed strictly: rows with an empty
+    TargetFileShareName are SKIPPED and reported (an empty cell may be a mistake).
+
+.PARAMETER CreateTargetShareIfMissing
+    Opt-in. When specified, a target file share that does not exist in the target
+    storage account is created automatically before the restore is triggered.
+    Without this switch the environment is taken as-is: rows whose target share
+    does not exist are SKIPPED and reported (the share may be missing by mistake).
+
 .EXAMPLE
     .\Bulk-Restore-AzureFileShare-RestAPI.ps1 -CsvPath "C:\inputs\restores.csv"
     Runs bulk restore using the specified CSV file (up to 5 concurrent).
@@ -82,6 +113,21 @@
 .EXAMPLE
     .\Bulk-Restore-AzureFileShare-RestAPI.ps1 -MaxParallel 1
     Runs bulk restore one item at a time (sequential).
+
+.EXAMPLE
+    .\Bulk-Restore-AzureFileShare-RestAPI.ps1 -CsvPath "C:\inputs\restores.csv" -UseSourceNameIfEmpty
+    Rows with an empty TargetFileShareName restore into a share named like the
+    source share (instead of being skipped). The share must already exist.
+
+.EXAMPLE
+    .\Bulk-Restore-AzureFileShare-RestAPI.ps1 -CsvPath "C:\inputs\restores.csv" -CreateTargetShareIfMissing
+    Target shares that do not exist yet are created automatically. Share names
+    are still taken strictly from the CSV (empty names are skipped).
+
+.EXAMPLE
+    .\Bulk-Restore-AzureFileShare-RestAPI.ps1 -CsvPath "C:\inputs\restores.csv" -UseSourceNameIfEmpty -CreateTargetShareIfMissing
+    Fully automated destination handling: empty TargetFileShareName cells use
+    the source share name, and missing target shares are created automatically.
 
 .NOTES
     Author: AFS Backup Expert
@@ -95,7 +141,13 @@ param(
     [string]$CsvPath,
 
     [Parameter(Mandatory=$false)]
-    [int]$MaxParallel = 5
+    [int]$MaxParallel = 5,
+
+    [Parameter(Mandatory=$false)]
+    [switch]$UseSourceNameIfEmpty,
+
+    [Parameter(Mandatory=$false)]
+    [switch]$CreateTargetShareIfMissing
 )
 
 # ============================================================================
@@ -160,6 +212,20 @@ if ($useParallel) {
 }
 Write-Host ""
 
+# Automation options (strict-CSV philosophy: deviations are opt-in switches)
+Write-Host "  Automation options:" -ForegroundColor Cyan
+if ($UseSourceNameIfEmpty) {
+    Write-Host "    -UseSourceNameIfEmpty       ON  : empty TargetFileShareName cells use the SOURCE share name" -ForegroundColor DarkYellow
+} else {
+    Write-Host "    -UseSourceNameIfEmpty       off : rows with an empty TargetFileShareName are SKIPPED" -ForegroundColor Gray
+}
+if ($CreateTargetShareIfMissing) {
+    Write-Host "    -CreateTargetShareIfMissing ON  : missing target shares will be AUTO-CREATED" -ForegroundColor DarkYellow
+} else {
+    Write-Host "    -CreateTargetShareIfMissing off : rows whose target share does not exist are SKIPPED" -ForegroundColor Gray
+}
+Write-Host ""
+
 # Preview
 Write-Host "Restores to perform:" -ForegroundColor Cyan
 Write-Host ""
@@ -170,13 +236,29 @@ $itemNum = 1
 foreach ($row in $csvData) {
     $src = "$($row.SourceStorageAccountName)/$($row.SourceFileShareName)"
     $recType = if ([string]::IsNullOrWhiteSpace($row.RecoveryType)) { "AlternateLocation" } else { $row.RecoveryType }
-    $tgt = if ($recType -eq "AlternateLocation") { "$($row.TargetStorageAccountName)/$($row.TargetFileShareName)" } else { "(original)" }
+    $tgtShare = if ([string]::IsNullOrWhiteSpace($row.TargetFileShareName)) {
+        if ($UseSourceNameIfEmpty) { "$($row.SourceFileShareName)*" } else { "<MISSING!>" }
+    } else { $row.TargetFileShareName }
+    $tgt = if ($recType -eq "AlternateLocation") { "$($row.TargetStorageAccountName)/$tgtShare" } else { "(original)" }
     $rp = if ([string]::IsNullOrWhiteSpace($row.RecoveryPoint)) { "latest" } else { $row.RecoveryPoint }
     Write-Host ("{0,-5} {1,-28} {2,-18} {3,-28} {4,-10}" -f $itemNum, $src, $recType, $tgt, $rp) -ForegroundColor White
     $itemNum++
 }
 
 Write-Host ""
+$rowsWithEmptyTargetName = @($csvData | Where-Object {
+    ([string]::IsNullOrWhiteSpace($_.RecoveryType) -or $_.RecoveryType.Trim() -eq "AlternateLocation") -and
+    [string]::IsNullOrWhiteSpace($_.TargetFileShareName)
+})
+if ($rowsWithEmptyTargetName.Count -gt 0) {
+    if ($UseSourceNameIfEmpty) {
+        Write-Host "  * = TargetFileShareName was empty in the CSV; the SOURCE share name will be used (-UseSourceNameIfEmpty)." -ForegroundColor DarkYellow
+    } else {
+        Write-Host "  NOTE: $($rowsWithEmptyTargetName.Count) row(s) show <MISSING!> (empty TargetFileShareName) and will be SKIPPED." -ForegroundColor DarkYellow
+        Write-Host "        Fix the CSV, or re-run with -UseSourceNameIfEmpty to use the source share name for those rows." -ForegroundColor DarkYellow
+    }
+    Write-Host ""
+}
 
 # Caution: AFS vaulted-policy restore support notes
 Write-Host "IMPORTANT (AFS Vaulted Policy):" -ForegroundColor DarkYellow
@@ -241,7 +323,7 @@ $headers = @{
 # it needs is passed in as parameters (no reliance on $using: inside the body).
 
 $workerText = @'
-param($row, $itemIndex, $totalItems, $headers, $apiVersion)
+param($row, $itemIndex, $totalItems, $headers, $apiVersion, $useSourceNameIfEmpty, $createTargetShareIfMissing)
 
 Add-Type -AssemblyName System.Web
 
@@ -291,6 +373,14 @@ $targetFileShare = if ($null -ne $row.TargetFileShareName) { $row.TargetFileShar
 $targetFolderPath = if ($null -ne $row.TargetFolderPath -and -not [string]::IsNullOrWhiteSpace($row.TargetFolderPath)) { $row.TargetFolderPath.Trim() } else { $null }
 $itemPathsRaw = if ($null -ne $row.ItemPaths) { $row.ItemPaths.Trim() } else { "" }
 
+# -UseSourceNameIfEmpty (opt-in): fall back to the SOURCE share name when the
+# CSV leaves TargetFileShareName empty. Default behavior (switch absent) is
+# strict: such rows are skipped by the validation below.
+if ($useSourceNameIfEmpty -and $recoveryType -eq "AlternateLocation" -and [string]::IsNullOrWhiteSpace($targetFileShare)) {
+    $targetFileShare = $sourceFileShare
+    Say "  NOTE: TargetFileShareName empty in CSV - using source share name '$sourceFileShare' (-UseSourceNameIfEmpty)" DarkYellow
+}
+
 $targetLabel = if ($recoveryType -eq "AlternateLocation") { "$targetStorageAccount/$targetFileShare" } else { "(original)" }
 
 $itemResult = @{
@@ -316,14 +406,18 @@ if ([string]::IsNullOrWhiteSpace($vaultSubscriptionId) -or [string]::IsNullOrWhi
     return (Emit $itemResult)
 }
 
-# --- Validate ALR target fields ---
-if ($recoveryType -eq "AlternateLocation" -and (
-    [string]::IsNullOrWhiteSpace($targetResourceGroup) -or [string]::IsNullOrWhiteSpace($targetStorageAccount) -or
-    [string]::IsNullOrWhiteSpace($targetFileShare))) {
-    Say "  SKIPPED: AlternateLocation restore requires Target storage account/resource group/file share" Yellow
-    $itemResult.Status = "SKIPPED"
-    $itemResult.Detail = "Missing target fields for AlternateLocation restore"
-    return (Emit $itemResult)
+# --- Validate ALR target fields (strict: every field must be in the CSV) ---
+if ($recoveryType -eq "AlternateLocation") {
+    $missingTargetFields = @()
+    if ([string]::IsNullOrWhiteSpace($targetResourceGroup))  { $missingTargetFields += "TargetStorageAccountResourceGroup" }
+    if ([string]::IsNullOrWhiteSpace($targetStorageAccount)) { $missingTargetFields += "TargetStorageAccountName" }
+    if ([string]::IsNullOrWhiteSpace($targetFileShare))      { $missingTargetFields += "TargetFileShareName" }
+    if ($missingTargetFields.Count -gt 0) {
+        Say "  SKIPPED: Missing $($missingTargetFields -join ', ') in CSV row - required for AlternateLocation restore. Fix the CSV and re-run." Yellow
+        $itemResult.Status = "SKIPPED"
+        $itemResult.Detail = "Missing CSV field(s): $($missingTargetFields -join ', ')"
+        return (Emit $itemResult)
+    }
 }
 
 # --- Construct source identifiers ---
@@ -437,6 +531,40 @@ if ($restoreRequestType -eq "ItemLevelRestore") {
 
 if ($recoveryType -eq "AlternateLocation") {
     $targetResourceId = "/subscriptions/$targetSubscriptionId/resourceGroups/$targetResourceGroup/providers/Microsoft.Storage/storageAccounts/$targetStorageAccount"
+
+    # Check the target file share exists (the restore service does not create it).
+    # Missing share: SKIP the row (strict default), or create it when
+    # -CreateTargetShareIfMissing was specified.
+    $shareUri = "https://management.azure.com$targetResourceId/fileServices/default/shares/${targetFileShare}?api-version=2023-05-01"
+    try {
+        Invoke-RestRetry $shareUri "GET" $headers | Out-Null
+        Say "    Target share '$targetFileShare' exists" Gray
+    } catch {
+        $shareSc = $null; try { $shareSc = $_.Exception.Response.StatusCode.value__ } catch { }
+        if ($shareSc -eq 404) {
+            if ($createTargetShareIfMissing) {
+                Say "    Target share '$targetFileShare' not found - creating (-CreateTargetShareIfMissing)..." Yellow
+                try {
+                    Invoke-RestRetry $shareUri "PUT" $headers '{"properties":{}}' | Out-Null
+                    Say "    Target share created" Green
+                } catch {
+                    Say "    FAILED: Could not create target share - $($_.Exception.Message)" Red
+                    $itemResult.Status = "FAILED"
+                    $itemResult.Detail = "Target share '$targetFileShare' missing and creation failed - check permissions on '$targetStorageAccount'"
+                    return (Emit $itemResult)
+                }
+            } else {
+                Say "    SKIPPED: Target share '$targetFileShare' does not exist in '$targetStorageAccount'." Yellow
+                Say "             Create it first, or re-run with -CreateTargetShareIfMissing to auto-create." Yellow
+                $itemResult.Status = "SKIPPED"
+                $itemResult.Detail = "Target share '$targetFileShare' does not exist in '$targetStorageAccount' (create it first, or use -CreateTargetShareIfMissing)"
+                return (Emit $itemResult)
+            }
+        } else {
+            Say "    WARNING: Could not verify target share (HTTP $shareSc) - continuing" Yellow
+        }
+    }
+
     $requestProperties.targetDetails = @{
         name = $targetFileShare
         targetResourceId = $targetResourceId
@@ -531,6 +659,8 @@ Write-Host ""
 
 $results = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
 $totalStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+$useSourceNameFlag = [bool]$UseSourceNameIfEmpty
+$createShareFlag = [bool]$CreateTargetShareIfMissing
 
 if ($useParallel) {
     $indexed = for ($i = 0; $i -lt $csvData.Count; $i++) { [pscustomobject]@{ Row = $csvData[$i]; Index = $i + 1 } }
@@ -538,7 +668,7 @@ if ($useParallel) {
         $pi = $_
         try {
             $sb = [scriptblock]::Create($using:workerText)
-            $r = & $sb $pi.Row $pi.Index $using:totalItems $using:headers $using:apiVersion
+            $r = & $sb $pi.Row $pi.Index $using:totalItems $using:headers $using:apiVersion $using:useSourceNameFlag $using:createShareFlag
         } catch {
             $r = [pscustomobject]@{ Index = $pi.Index; Item = "(row $($pi.Index))"; Status = "FAILED"; Detail = "Unhandled error: $($_.Exception.Message)"; Duration = "0s" }
         }
@@ -550,7 +680,7 @@ if ($useParallel) {
     foreach ($row in $csvData) {
         $i++
         try {
-            $r = & $sb $row $i $totalItems $headers $apiVersion
+            $r = & $sb $row $i $totalItems $headers $apiVersion $useSourceNameFlag $createShareFlag
         } catch {
             $r = [pscustomobject]@{ Index = $i; Item = "(row $i)"; Status = "FAILED"; Detail = "Unhandled error: $($_.Exception.Message)"; Duration = "0s" }
         }
@@ -613,6 +743,17 @@ if ($failedCount -gt 0) {
     Write-Host "  2. Recovery point name not found / no recovery points available" -ForegroundColor White
     Write-Host "  3. Target storage account/file share invalid or insufficient permissions" -ForegroundColor White
     Write-Host "  4. Unsupported restore option for AFS vaulted policy (ILR/OLR, non-Overwrite)" -ForegroundColor White
+    Write-Host ""
+}
+
+if ($skippedCount -gt 0) {
+    Write-Host "NOTE: $skippedCount item(s) were SKIPPED because the CSV is followed strictly." -ForegroundColor Yellow
+    Write-Host "Check the Detail column above (and in the _Results.csv). Common reasons and fixes:" -ForegroundColor Yellow
+    Write-Host "  - Empty TargetFileShareName          -> fill it in the CSV, or re-run with -UseSourceNameIfEmpty" -ForegroundColor White
+    Write-Host "  - Target share does not exist        -> create it, or re-run with -CreateTargetShareIfMissing" -ForegroundColor White
+    Write-Host "  - Missing required source/vault CSV fields -> fill them in the CSV" -ForegroundColor White
+    Write-Host "  TIP: When re-running, keep only the skipped rows in the CSV - re-running the full" -ForegroundColor Gray
+    Write-Host "       file would trigger the successful restores again (Overwrite)." -ForegroundColor Gray
     Write-Host ""
 }
 

@@ -59,6 +59,39 @@ How -MaxParallel works (technically):
     (throttling) risk, which is why the default is a conservative 5.
 
 
+AUTOMATION SWITCHES (STRICT-CSV PHILOSOPHY)
+-------------------------------------------
+By default the script follows the CSV 100% and expects the target environment
+to be ready. Any row that does not meet a precondition is SKIPPED and clearly
+reported (on screen and in the _Results.csv) — the script never guesses,
+because an empty cell or a missing share may be a mistake.
+
+Two OPT-IN switches let sysadmins automate those preconditions deliberately:
+
+  -UseSourceNameIfEmpty
+      Empty TargetFileShareName cells use the SOURCE share name as the
+      destination share name (instead of the row being skipped).
+
+  -CreateTargetShareIfMissing
+      Target file shares that do not exist in the target storage account are
+      created automatically before the restore (instead of the row being
+      skipped). Requires write access (Contributor) on the target storage
+      account.
+
+How the switches combine:
+
+                                 | Share EXISTS      | Share MISSING
+  -------------------------------+-------------------+----------------------------
+  no switches                    | restore runs      | row SKIPPED + reported
+  -CreateTargetShareIfMissing    | restore runs      | share created, restore runs
+  -UseSourceNameIfEmpty only     | restore runs      | row SKIPPED + reported
+  both switches                  | restore runs      | share created, restore runs
+                                   (empty name cells use the source share name)
+
+The active state of both switches is printed in the "Automation options" block
+before the confirmation prompt, so you always see the mode before anything runs.
+
+
 IMPORTANT — AFS Vaulted Policy Restore Support:
   1. Only ALR (Alternate Location) restore is released in production. ILR and
      OLR are not released yet for the vaulted policy.
@@ -123,6 +156,18 @@ File: Bulk-Restore-AzureFileShare-RestAPI_Input.csv
     TargetStorageAccountResourceGroup    Resource group of the target storage account [ALR only]
     TargetStorageAccountName             Name of the target storage account [ALR only]
     TargetFileShareName                  Name of the target file share [ALR only]
+                                         REQUIRED - rows with an empty value are
+                                         SKIPPED and reported (empty may indicate
+                                         a CSV mistake), UNLESS the script is run
+                                         with -UseSourceNameIfEmpty, in which case
+                                         empty cells use the SOURCE share name as
+                                         the destination.
+                                         The share must already exist in the
+                                         target storage account - rows whose
+                                         share is missing are SKIPPED and
+                                         reported, UNLESS the script is run with
+                                         -CreateTargetShareIfMissing, in which
+                                         case it is created automatically.
     TargetFolderPath                     Optional target folder (empty = root) [ALR only]
     ItemPaths                            Semicolon-separated paths for ItemLevelRestore,
                                          each "File:path" or "Folder:path"
@@ -150,6 +195,15 @@ HOW TO RUN
   Sequential (one at a time):
     .\Bulk-Restore-AzureFileShare-RestAPI.ps1 -CsvPath ".\restores.csv" -MaxParallel 1
 
+  Empty TargetFileShareName cells use the source share name:
+    .\Bulk-Restore-AzureFileShare-RestAPI.ps1 -CsvPath ".\restores.csv" -UseSourceNameIfEmpty
+
+  Auto-create target shares that do not exist yet:
+    .\Bulk-Restore-AzureFileShare-RestAPI.ps1 -CsvPath ".\restores.csv" -CreateTargetShareIfMissing
+
+  Fully automated destination handling (both switches):
+    .\Bulk-Restore-AzureFileShare-RestAPI.ps1 -CsvPath ".\restores.csv" -UseSourceNameIfEmpty -CreateTargetShareIfMissing
+
   Without parameter (prompts or uses default):
     .\Bulk-Restore-AzureFileShare-RestAPI.ps1
 
@@ -170,8 +224,13 @@ RESULT STATUSES
   FAILED   — An error occurred (source not protected, recovery point not found,
              invalid target, unsupported option, or the async op reported
              'Failed'). The Detail column shows the specific error.
-  SKIPPED  — Missing required source/vault fields, or missing target fields for
-             an AlternateLocation restore.
+  SKIPPED  — A precondition was not met and the row was NOT attempted (the CSV
+             is followed strictly). The Detail column names the exact reason:
+               - Missing required source/vault CSV fields
+               - Empty TargetFileShareName          (fix the CSV, or use
+                                                     -UseSourceNameIfEmpty)
+               - Target share does not exist        (create it, or use
+                                                     -CreateTargetShareIfMissing)
 
 
 EXAMPLES
@@ -201,7 +260,34 @@ Example 3 — Item Level Restore of specific files/folders
   (ILR is not released for the AFS vaulted policy; use for snapshot-tier only.)
 
 
-Example 4 — Using Azure CLI for authentication
+Example 4 — Strict mode (default): skipped rows tell you what to fix
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  PS> .\Bulk-Restore-AzureFileShare-RestAPI.ps1 -CsvPath ".\my-restores.csv"
+
+  CSV row 2 has an empty TargetFileShareName, and row 3 targets a share that
+  was never created. Neither row is restored. The preview shows row 2 as
+  <MISSING!>, and the results report:
+
+    2  stgsa01/hr-data      SKIPPED   Missing CSV field(s): TargetFileShareName
+    3  stgsa01/finance-data SKIPPED   Target share 'finance-data-restored' does
+                                      not exist in 'rocstoragedest' (create it
+                                      first, or use -CreateTargetShareIfMissing)
+
+  Fix the CSV / environment (or add the switches) and re-run with only the
+  skipped rows in the file.
+
+
+Example 5 — Fully automated destination handling (both switches)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  PS> .\Bulk-Restore-AzureFileShare-RestAPI.ps1 -CsvPath ".\my-restores.csv" `
+        -UseSourceNameIfEmpty -CreateTargetShareIfMissing
+
+  Rows may leave TargetFileShareName empty (the source share name is used),
+  and target shares are created automatically if they do not exist. Useful for
+  large DR drills where dozens of shares restore into a fresh storage account.
+
+
+Example 6 — Using Azure CLI for authentication
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   PS> az login
   PS> .\Bulk-Restore-AzureFileShare-RestAPI.ps1 -CsvPath ".\my-restores.csv"

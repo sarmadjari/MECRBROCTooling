@@ -99,7 +99,10 @@ INPUTS (PROMPTED AT RUNTIME)
     - Target Subscription ID
     - Target Resource Group Name
     - Target Storage Account Name
-    - Target File Share Name
+    - Target File Share Name     (press Enter = same name as source share;
+                                  if the share does not exist in the target
+                                  storage account, the script offers to
+                                  create it)
     - Target Folder Path (optional)
 
   Section 6 — Item Specification (Item Level Restore only):

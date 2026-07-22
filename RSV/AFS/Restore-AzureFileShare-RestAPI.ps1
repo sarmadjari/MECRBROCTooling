@@ -350,10 +350,14 @@ if ($recoveryType -eq "AlternateLocation") {
     
     Write-Host ""
     Write-Host "Target File Share Name:" -ForegroundColor Cyan
+    Write-Host "  NOTE: If you do not enter a name (just press Enter), the SOURCE share name" -ForegroundColor DarkYellow
+    Write-Host "        '$sourceFileShare' will be used as the destination share name." -ForegroundColor DarkYellow
+    Write-Host "        If the share does not exist in the target storage account, the script" -ForegroundColor DarkYellow
+    Write-Host "        will offer to create it." -ForegroundColor DarkYellow
     $targetFileShare = Read-Host "  Enter File Share Name"
     if ([string]::IsNullOrWhiteSpace($targetFileShare)) {
-        Write-Host "ERROR: Target File Share Name cannot be empty." -ForegroundColor Red
-        exit 1
+        $targetFileShare = $sourceFileShare
+        Write-Host "  Using source share name: $targetFileShare" -ForegroundColor Gray
     }
     
     Write-Host ""
@@ -373,10 +377,47 @@ if ($recoveryType -eq "AlternateLocation") {
         name = $targetFileShare
         targetResourceId = $targetResourceId
     }
-    
+
     Write-Host ""
     Write-Host "Target Resource ID:" -ForegroundColor Gray
     Write-Host "  $targetResourceId" -ForegroundColor Gray
+
+    # ------------------------------------------------------------------
+    # Verify the target file share exists; create it if missing.
+    # The restore service does NOT create the destination share.
+    # ------------------------------------------------------------------
+    $storageApiVersion = "2023-05-01"
+    $shareUri = "https://management.azure.com$targetResourceId/fileServices/default/shares/${targetFileShare}?api-version=$storageApiVersion"
+    $shareHeaders = @{ "Authorization" = "Bearer $token"; "Content-Type" = "application/json" }
+
+    Write-Host ""
+    Write-Host "Checking target file share '$targetFileShare' exists..." -ForegroundColor Cyan
+    try {
+        Invoke-RestMethod -Uri $shareUri -Method GET -Headers $shareHeaders | Out-Null
+        Write-Host "  Target file share exists." -ForegroundColor Green
+    } catch {
+        $shareStatus = $null
+        try { $shareStatus = $_.Exception.Response.StatusCode.value__ } catch { }
+        if ($shareStatus -eq 404) {
+            Write-Host "  Target file share does not exist in '$targetStorageAccount'." -ForegroundColor Yellow
+            Write-Host "  Create it now? (Y/n):" -ForegroundColor Cyan
+            $createShare = Read-Host "  Enter choice"
+            if ($createShare -ieq 'n') {
+                Write-Host "ERROR: Target file share must exist before restore. Create it and re-run." -ForegroundColor Red
+                exit 1
+            }
+            try {
+                Invoke-RestMethod -Uri $shareUri -Method PUT -Headers $shareHeaders -Body '{"properties":{}}' | Out-Null
+                Write-Host "  Target file share created." -ForegroundColor Green
+            } catch {
+                Write-Host "ERROR: Failed to create target file share: $($_.Exception.Message)" -ForegroundColor Red
+                Write-Host "  Check you have Contributor on storage account '$targetStorageAccount'." -ForegroundColor Yellow
+                exit 1
+            }
+        } else {
+            Write-Host "  WARNING: Could not verify target share (HTTP $shareStatus). Continuing..." -ForegroundColor Yellow
+        }
+    }
 }
 
 # ============================================================================
