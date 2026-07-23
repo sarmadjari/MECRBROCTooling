@@ -98,11 +98,26 @@ INPUTS (PROMPTED AT RUNTIME)
       - Datasource (Source VM) Region (for cross-region detection)
 
     Alternate Location only:
-      - Target VM Name
+      - Target VM Name             (press Enter = same name as the SOURCE VM;
+                                    the restore CREATES this VM, so the name
+                                    must not already exist in the target RG)
       - Target Resource Group Name and Subscription
       - Target VNet Name and Resource Group
       - Target Subnet Name
       - Datasource (Source VM) Region (for cross-region detection)
+
+  Section 5B — Pre-Flight Validation (automatic, fail-early):
+    Before the restore request is built, the script verifies:
+      - Staging storage account exists, is in the VAULT's region, and is
+        not zone-redundant (ZRS is unsupported for VM restore staging)
+      - Target resource group exists      (Alternate Location)
+      - Target VM name is NOT in use      (Alternate Location - the restore
+                                           creates the VM)
+      - Target VNet and subnet exist      (Alternate Location)
+      - Disk target resource group exists (Restore Disks, when provided)
+    Any failure stops the script BEFORE triggering a restore, with the exact
+    fix (e.g. the 'az group create' command) printed. Governance objects
+    (resource groups, VNets) are never auto-created by the script.
 
 
 API VERSION USED

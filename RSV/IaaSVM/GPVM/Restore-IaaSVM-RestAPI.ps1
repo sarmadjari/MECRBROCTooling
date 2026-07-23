@@ -510,10 +510,14 @@ if ($recoveryType -eq "AlternateLocation") {
     Write-Host ""
     
     Write-Host "  Target VM Name:" -ForegroundColor Cyan
+    Write-Host "    NOTE: If you do not enter a name (just press Enter), the SOURCE VM name" -ForegroundColor DarkYellow
+    Write-Host "          '$sourceVMName' will be used as the new (restored) VM name." -ForegroundColor DarkYellow
+    Write-Host "          The restore CREATES this VM - the name must not already exist in the target RG" -ForegroundColor DarkYellow
+    Write-Host "          (checked automatically in pre-flight validation)." -ForegroundColor DarkYellow
     $targetVMName = Read-Host "    Enter Target VM Name"
     if ([string]::IsNullOrWhiteSpace($targetVMName)) {
-        Write-Host "ERROR: Target VM Name cannot be empty." -ForegroundColor Red
-        exit 1
+        $targetVMName = $sourceVMName
+        Write-Host "    Using source VM name: $targetVMName" -ForegroundColor Gray
     }
     
     Write-Host ""
@@ -578,6 +582,149 @@ if ($recoveryType -eq "AlternateLocation") {
     Write-Host "    VNet:        $targetVNetId" -ForegroundColor Gray
     Write-Host "    Subnet:      $targetSubnetId" -ForegroundColor Gray
 }
+
+# ============================================================================
+# SECTION 5B: PRE-FLIGHT VALIDATION
+# ============================================================================
+# Fail early with clear guidance instead of triggering a restore job that
+# would fail on the Azure side minutes (or hours) later.
+# Governance objects (resource groups, VNets) are NEVER auto-created by this
+# script - validation reports the exact command / action needed instead.
+
+Write-Host ""
+Write-Host "SECTION 5B: Pre-Flight Validation" -ForegroundColor Yellow
+Write-Host "-----------------------------------" -ForegroundColor Yellow
+Write-Host ""
+
+$preFlightFailed = $false
+
+# --- Staging storage account: must exist, in the VAULT's region, not ZRS ---
+Write-Host "Checking staging storage account '$storageAccountName'..." -ForegroundColor Cyan
+$saCheckUri = "https://management.azure.com$storageAccountId`?api-version=2023-05-01"
+$stagingSA = $null
+try {
+    $stagingSA = Invoke-RestMethod -Uri $saCheckUri -Method GET -Headers $headers
+    Write-Host "  Storage account exists (Location: $($stagingSA.location) | SKU: $($stagingSA.sku.name))" -ForegroundColor Green
+    if ($stagingSA.sku.name -match "ZRS") {
+        Write-Host "  ERROR: '$($stagingSA.sku.name)' is zone-redundant. ZRS staging accounts are not supported for VM restore." -ForegroundColor Red
+        $preFlightFailed = $true
+    }
+} catch {
+    $sc = $null; try { $sc = $_.Exception.Response.StatusCode.value__ } catch { }
+    if ($sc -eq 404) {
+        Write-Host "  ERROR: Staging storage account not found." -ForegroundColor Red
+        Write-Host "  Create it in the VAULT's region first, e.g.:" -ForegroundColor Yellow
+        Write-Host "    az storage account create --name $storageAccountName --resource-group $storageResourceGroup --location <vault-region> --sku Standard_LRS" -ForegroundColor White
+        $preFlightFailed = $true
+    } else {
+        Write-Host "  WARNING: Could not verify staging storage account (HTTP $sc). Continuing..." -ForegroundColor Yellow
+    }
+}
+
+# Cross-check the staging account region against the vault's region
+if ($stagingSA) {
+    try {
+        $vaultResUri = "https://management.azure.com/subscriptions/$vaultSubscriptionId/resourceGroups/$vaultResourceGroup/providers/Microsoft.RecoveryServices/vaults/$vaultName`?api-version=2023-04-01"
+        $vaultRes = Invoke-RestMethod -Uri $vaultResUri -Method GET -Headers $headers
+        if ($vaultRes.location -and ($stagingSA.location -ne $vaultRes.location)) {
+            Write-Host "  ERROR: Staging account region '$($stagingSA.location)' does not match the vault region '$($vaultRes.location)'." -ForegroundColor Red
+            Write-Host "  VM restore requires the staging account to be in the SAME region as the vault." -ForegroundColor Yellow
+            $preFlightFailed = $true
+        } elseif ($vaultRes.location) {
+            Write-Host "  Staging account region matches the vault region ($($vaultRes.location))" -ForegroundColor Green
+        }
+    } catch {
+        Write-Host "  NOTE: Could not read the vault's region to cross-check the staging account. Continuing..." -ForegroundColor Yellow
+    }
+}
+
+if ($recoveryType -eq "AlternateLocation") {
+    # --- Target resource group must exist (governance object: never auto-created) ---
+    Write-Host ""
+    Write-Host "Checking target resource group '$targetRGName'..." -ForegroundColor Cyan
+    $rgUri = "https://management.azure.com/subscriptions/$targetSubId/resourcegroups/$targetRGName`?api-version=2021-04-01"
+    try {
+        $rgRes = Invoke-RestMethod -Uri $rgUri -Method GET -Headers $headers
+        Write-Host "  Resource group exists (Location: $($rgRes.location))" -ForegroundColor Green
+    } catch {
+        $sc = $null; try { $sc = $_.Exception.Response.StatusCode.value__ } catch { }
+        if ($sc -eq 404) {
+            Write-Host "  ERROR: Target resource group does not exist." -ForegroundColor Red
+            Write-Host "  Resource groups carry tags/RBAC/policy - create it deliberately with your standards, then re-run:" -ForegroundColor Yellow
+            Write-Host "    az group create --name $targetRGName --location $restoreRegion" -ForegroundColor White
+            $preFlightFailed = $true
+        } else {
+            Write-Host "  WARNING: Could not verify target resource group (HTTP $sc). Continuing..." -ForegroundColor Yellow
+        }
+    }
+
+    # --- Target VM name must be FREE (the restore creates the VM) ---
+    Write-Host ""
+    Write-Host "Checking target VM name '$targetVMName' is not in use..." -ForegroundColor Cyan
+    $vmCheckUri = "https://management.azure.com$targetVirtualMachineId`?api-version=2023-07-01"
+    try {
+        Invoke-RestMethod -Uri $vmCheckUri -Method GET -Headers $headers | Out-Null
+        Write-Host "  ERROR: A VM named '$targetVMName' already exists in resource group '$targetRGName'." -ForegroundColor Red
+        Write-Host "  The restore CREATES the target VM - choose a name that is not in use." -ForegroundColor Yellow
+        $preFlightFailed = $true
+    } catch {
+        $sc = $null; try { $sc = $_.Exception.Response.StatusCode.value__ } catch { }
+        if ($sc -eq 404) {
+            Write-Host "  Target VM name is available" -ForegroundColor Green
+        } else {
+            Write-Host "  WARNING: Could not verify target VM name (HTTP $sc). Continuing..." -ForegroundColor Yellow
+        }
+    }
+
+    # --- Target VNet + subnet must exist (network objects: never auto-created) ---
+    Write-Host ""
+    Write-Host "Checking target VNet/subnet '$targetVNetName/$targetSubnetName'..." -ForegroundColor Cyan
+    $subnetCheckUri = "https://management.azure.com$targetSubnetId`?api-version=2023-04-01"
+    try {
+        Invoke-RestMethod -Uri $subnetCheckUri -Method GET -Headers $headers | Out-Null
+        Write-Host "  VNet and subnet exist" -ForegroundColor Green
+    } catch {
+        $sc = $null; try { $sc = $_.Exception.Response.StatusCode.value__ } catch { }
+        if ($sc -eq 404) {
+            Write-Host "  ERROR: VNet '$targetVNetName' or subnet '$targetSubnetName' not found (VNet RG: $targetVNetRG)." -ForegroundColor Red
+            Write-Host "  Virtual networks are network-team/governance objects - this script will not create them." -ForegroundColor Yellow
+            Write-Host "  Verify the names, or have the VNet/subnet provisioned, then re-run." -ForegroundColor Yellow
+            $preFlightFailed = $true
+        } else {
+            Write-Host "  WARNING: Could not verify VNet/subnet (HTTP $sc). Continuing..." -ForegroundColor Yellow
+        }
+    }
+}
+
+# --- RestoreDisks: optional target RG for restored disks must exist if provided ---
+if ($recoveryType -eq "RestoreDisks" -and $targetResourceGroupId) {
+    Write-Host ""
+    Write-Host "Checking target resource group for restored disks..." -ForegroundColor Cyan
+    $diskRgUri = "https://management.azure.com$targetResourceGroupId`?api-version=2021-04-01"
+    try {
+        Invoke-RestMethod -Uri $diskRgUri -Method GET -Headers $headers | Out-Null
+        Write-Host "  Disk target resource group exists" -ForegroundColor Green
+    } catch {
+        $sc = $null; try { $sc = $_.Exception.Response.StatusCode.value__ } catch { }
+        if ($sc -eq 404) {
+            Write-Host "  ERROR: Resource group for restored disks does not exist: $targetResourceGroupId" -ForegroundColor Red
+            Write-Host "    az group create --name $targetRGForDisks --location $restoreRegion" -ForegroundColor White
+            $preFlightFailed = $true
+        } else {
+            Write-Host "  WARNING: Could not verify disk target RG (HTTP $sc). Continuing..." -ForegroundColor Yellow
+        }
+    }
+}
+
+if ($preFlightFailed) {
+    Write-Host ""
+    Write-Host "ERROR: Pre-flight validation failed. Fix the issue(s) above and re-run." -ForegroundColor Red
+    Write-Host "  (Failing now avoids triggering a restore job that would fail later on the Azure side.)" -ForegroundColor Yellow
+    exit 1
+}
+
+Write-Host ""
+Write-Host "Pre-flight validation passed." -ForegroundColor Green
 
 # ============================================================================
 # SECTION 6: CONSTRUCT RESTORE REQUEST BODY
